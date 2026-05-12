@@ -34,8 +34,6 @@ The board version is usually printed on the back of the PCB.
 
 Pala One is based on:
 - Heltec Wireless Paper
-- ESP32
-- E-Ink display
 - 3D printed housing
 - LiPo battery
 
