@@ -1,7 +1,7 @@
 #include <heltec-eink-modules.h>
 
 // ── Board selection: uncomment the line that matches your hardware ────────────
-#define BOARD_V1_1
+//#define BOARD_V1_1
 // #define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -30,6 +30,7 @@ DisplayType display;
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
+#include <esp_rtc_time.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
@@ -2605,6 +2606,30 @@ static uint32_t api_pendingPresses() {
   return n;
 }
 
+static uint32_t api_rtcSeconds() {
+  return (uint32_t)(esp_rtc_get_time_us() / 1000000ULL);
+}
+
+static int api_storageRead(const char* key, void* buf, int maxlen) {
+  char path[64];
+  snprintf(path, sizeof(path), "/apps/%s.dat", key);
+  File f = LittleFS.open(path, "r");
+  if (!f) return -1;
+  int n = f.read((uint8_t*)buf, maxlen);
+  f.close();
+  return n;
+}
+
+static int api_storageWrite(const char* key, const void* buf, int len) {
+  char path[64];
+  snprintf(path, sizeof(path), "/apps/%s.dat", key);
+  File f = LittleFS.open(path, "w");
+  if (!f) return -1;
+  int n = f.write((const uint8_t*)buf, len);
+  f.close();
+  return n;
+}
+
 static int api_snprintf_wrap(char* buf, int len, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -2626,6 +2651,9 @@ static void initPalaAPI() {
   g_palaAPI.buttonPressed     = api_buttonPressed;
   g_palaAPI.delayMs           = api_delayMs;
   g_palaAPI.pendingPresses    = api_pendingPresses;
+  g_palaAPI.storageRead       = api_storageRead;
+  g_palaAPI.storageWrite      = api_storageWrite;
+  g_palaAPI.rtcSeconds        = api_rtcSeconds;
 }
 
 // ---- App loader -------------------------------------------------------------

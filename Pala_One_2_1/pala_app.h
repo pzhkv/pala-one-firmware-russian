@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 #define PALA_APP_MAGIC    0x50414C41UL  // 'PALA'
-#define PALA_API_VERSION  1
+#define PALA_API_VERSION  3
 
 // Event codes returned by waitForEvent()
 #define PALA_CLICK   1

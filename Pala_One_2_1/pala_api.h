@@ -17,4 +17,7 @@ typedef struct {
     int      (*buttonPressed)(void);      // 1 if button currently held, 0 otherwise
     void     (*delayMs)(uint32_t ms);     // yield for ms milliseconds
     uint32_t (*pendingPresses)(void);     // count of individual short press-release events since last call; bypasses multi-click grouping
+    int      (*storageRead) (const char* key, void* buf, int maxlen);        // read from /apps/{key}.dat; returns bytes read, -1 on error
+    int      (*storageWrite)(const char* key, const void* buf, int len);     // write to /apps/{key}.dat; returns bytes written, -1 on error
+    uint32_t (*rtcSeconds)  (void);                                          // monotonic seconds; survives deep sleep; use for cross-session timing
 } PalaAPI;
