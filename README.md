@@ -1,4 +1,4 @@
-<img width="960" height="540" alt="tiny diy e-reader" src="https://github.com/user-attachments/assets/d9759b25-4ff6-4a7f-b3cc-f6fa9fc775e0" />
+<img width="1892" height="1053" alt="palaOne" src="https://github.com/user-attachments/assets/0fdef5ba-eabd-4b71-9a0c-4c1dc78a4bee" />
 
 # pala-one-firmware
 Pala One — A tiny E-Ink reader project by Paul Lagier
