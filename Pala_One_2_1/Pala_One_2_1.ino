@@ -1,26 +1,5 @@
 #include <heltec-eink-modules.h>
-
-#include "pala_app.h"
-#include "pala_api.h"
-#include <stdarg.h>
-
-// ── Board selection: uncomment the line that matches your hardware ────────────
-// #define BOARD_V1_1
-// #define BOARD_V1_2
-// ─────────────────────────────────────────────────────────────────────────────
-#ifdef BOARD_V1_1
-  using DisplayType = EInkDisplay_WirelessPaperV1_1;
-  #define BOARD_CHOSEN 
-#endif
-#if defined BOARD_V1_2
-  using DisplayType = EInkDisplay_WirelessPaperV1_2;
-  #define BOARD_CHOSEN 
-#endif
-#ifndef BOARD_CHOSEN
-  #error "Uncomment a board version"
-#endif
-
-DisplayType display;
+EInkDisplay_WirelessPaperV1_2 display;
 
 #include "pala_one_sleep_black_icon_v4.h"
 
@@ -36,17 +15,14 @@ DisplayType display;
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
-#include <esp_rtc_time.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
-#include <esp_heap_caps.h>
-#include <soc/soc.h>
 
 // ============================================================================
 //  Firmware / Product constants
 // ============================================================================
-#define FW_VERSION "2.1"
+#define FW_VERSION "2.0.0"
 
 static const int SCREEN_W = 250;
 static const int SCREEN_H = 122;
@@ -71,7 +47,7 @@ static const uint32_t DEBOUNCE_MS = 14;
 static const uint32_t SAVE_EVERY_MS = 7000;
 static const uint32_t TOAST_MS = 650;
 static const uint32_t UPLOAD_AUTO_EXIT_MS = 15UL * 60UL * 1000UL;
-static const uint32_t BAT_CACHE_MS = 180000; // 3 min — battery changes slowly
+static const uint32_t BAT_CACHE_MS = 120000;
 
 static const int FULL_REFRESH_EVERY_N_PAGES = 100;
 static const int MENU_FULL_REFRESH_EVERY = 60;
@@ -85,9 +61,9 @@ static const bool SHOW_PROGRESS_BAR = true;
 static const bool SHOW_PAGE_NUMBER = true;
 static const bool ENABLE_DEEP_SLEEP = true;
 
-static const uint8_t* PAGE_FONT = u8g2_font_5x8_tf;
-const uint8_t* MAIN_FONT = u8g2_font_helvR08_te;
-const uint8_t* BOLD_FONT = u8g2_font_helvB08_te;
+static const uint8_t* PAGE_FONT = u8g2_font_6x13_t_cyrillic;
+const uint8_t* MAIN_FONT = u8g2_font_6x13_t_cyrillic;
+const uint8_t* BOLD_FONT = u8g2_font_10x20_t_cyrillic;
 
 #define BTN 0
 #define HAS_BATTERY 1
@@ -107,8 +83,7 @@ enum Mode {
   MODE_LIST,
   MODE_BM_BOOK_SELECT,
   MODE_BM_LIST,
-  MODE_BM_PREVIEW,
-  MODE_APPS,
+  MODE_BM_PREVIEW
 };
 
 enum ReaderLongPressAction {
@@ -122,8 +97,7 @@ enum LibraryEntryType {
   LIB_ENTRY_BOOKMARKS,
   LIB_ENTRY_LIST,
   LIB_ENTRY_ABOUT,
-  LIB_ENTRY_UPLOAD,
-  LIB_ENTRY_APPS,
+  LIB_ENTRY_UPLOAD
 };
 
 struct BookInfo {
@@ -142,7 +116,7 @@ struct LayoutMetrics {
 };
 
 struct RuntimeSettings {
-  int fontSize = 8;
+  int fontSize = 6;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
   int readerLongPressAction = LONGPRESS_BOOKMARK;
@@ -210,44 +184,19 @@ struct ListState {
   int selectedIndex = 0;
 };
 
-#define MAX_APPS     16
-#define MAX_APP_NAME 32
-#define MAX_APP_PATH 80
-
-struct AppDiscovery {
-  char name[MAX_APP_NAME + 1];
-  char path[MAX_APP_PATH + 1];
-};
-
-struct AppsState {
-  AppDiscovery apps[MAX_APPS];
-  int count         = 0;
-  int selectedIndex = 0;
-};
-
 struct UploadState {
   File bookTmpFile;
   File sleepTmpFile;
-  File appTmpFile;
 
   String bookTmpPath;
   String bookPendingUtf8Tail;
   String bookFinalName;
   bool bookOk = false;
   String bookError;
-  // Cross-chunk state for streaming compactText() during upload, so
-  // whitespace runs that span chunk boundaries don't produce duplicates.
-  bool bookCompactLastWasSpace = false;
-  int  bookCompactNewlineCount = 0;
 
   String sleepTmpPath;
   bool sleepOk = false;
   String sleepError;
-
-  String appTmpPath;
-  String appFinalName;
-  bool appOk = false;
-  String appError;
 
   uint32_t startedMs = 0;
 };
@@ -278,8 +227,6 @@ struct ButtonState {
   bool quadClick = false;
   bool longClick = false;
 
-  uint32_t rawPressCount = 0; // every short press-release, unfiltered by multi-click windows
-
   void resetClicks() {
     shortClick = false;
     doubleClick = false;
@@ -296,7 +243,6 @@ struct ButtonState {
     lastRelease = 0;
     firstClickRelease = 0;
     clickCount = 0;
-    rawPressCount = 0;
     resetClicks();
   }
 
@@ -335,10 +281,6 @@ uint32_t g_offsetCacheStamp = 1;
 
 uint32_t lastUserActionMs = 0;
 int menuDrawsSinceFull = 0;
-static AppsState g_apps;
-static PalaAPI   g_palaAPI;
-static void*     g_appExecBuf  = nullptr;
-static size_t    g_appExecSize = 0;
 LayoutMetrics g_metrics;
 bool g_metricsValid = false;
 
@@ -358,7 +300,7 @@ volatile uint32_t g_isrDropCount = 0;
 // ============================================================================
 class HeltecGFXAdapter : public Adafruit_GFX {
 public:
-  explicit HeltecGFXAdapter(DisplayType& d)
+  explicit HeltecGFXAdapter(EInkDisplay_WirelessPaperV1_2& d)
     : Adafruit_GFX(SCREEN_W, SCREEN_H), disp(d) {}
 
   void drawPixel(int16_t x, int16_t y, uint16_t color) override {
@@ -370,7 +312,7 @@ public:
   }
 
 private:
-  DisplayType& disp;
+  EInkDisplay_WirelessPaperV1_2& disp;
 };
 HeltecGFXAdapter gfx(display);
 
@@ -404,28 +346,68 @@ static void idlePrefetchReader();
 static String pageCachePathForBook(const String& path);
 static bool loadPageOffsetCacheForBook(const String& path, size_t expectedSize);
 static void savePageOffsetCacheForBook(const String& path, size_t fileSize);
-static void invalidateAllPageCaches();
-static void relocateOpenBookToOffset(uint32_t targetOffset);
-static uint32_t resolveBookmarkOffset(const String& path, uint16_t page, uint32_t storedOffset);
-static String readPageTextForWeb(const String& path, int page);
+static size_t fsTotalBytesSafe();
+static size_t fsUsedBytesSafe();
+static size_t fsFreeBytesSafe();
 
+static String prefKeyForBook(const String& path);
+static uint32_t pageOffsetForPage(File& f, const String& path, int page);
+static inline bool isBookmarkLabelWordChar(char c);
+static String readBookmarkLabelAtOffset(File& f, uint32_t off, int page);
+static String bmKeyFor(const String& bookKey);
+static void deleteBookMetadata(const String& path);
+static void migrateBookMetadata(const String& oldPath, const String& newPath);
 
+static void loadBooks();
+static bool openBookByIndex(int idx);
+static void buildLibraryEntries();
 
+static void drawLibrary();
+static void drawAbout();
+static void drawListScreen();
+static void drawBookmarksBookSelect();
+static void drawBookmarksList();
+static void renderCurrentPage();
+static void drawSleepScreen();
+static void goToSleep();
+
+static void registerWebRoutes();
+static void startUploadMode();
+static void stopUploadModeToLibrary();
+
+static void handleRoot();
+static void handleFiles();
+static void handleDelete();
+static void handleCreateFolder();
+static void handleDeleteFolder();
+static void handleMoveBook();
+static void handleJumpPageWeb();
+static void handleListWeb();
+static void handleListSaveWeb();
+static void handleListClearDoneWeb();
+static void handleBookmarksWeb();
+static void handleDeleteBookmarkWeb();
+static void handleViewBookmarkWeb();
+static void handleExportBookmarksWeb();
+static void handleResetConfirm();
+static void handleResetDo();
+static void handleSettings();
+static void handleSettingsPost();
+static void handleDeleteSleepImg();
+static void handleUploadDone();
+static void handleUploadSleepDone();
+static void handleUploadBookStream();
+static void handleUploadSleepStream();
+static void loadListItems();
+static void saveListItems();
+static bool listHasVisibleItems();
+static void sanitizeListText(String& s);
+
+// ============================================================================
+//  Basic helpers
+// ============================================================================
 static bool fsBegin() {
-  // First try to mount without formatting — protects existing data.
-  if (FS.begin(false)) return true;
-
-  // Mount failed. This happens on a brand-new device where the LittleFS
-  // partition has never been formatted. Format once, then mount.
-  // If the partition already had data but is now corrupt, this wipes it —
-  // which is the correct recovery action (same as factory reset).
-  Serial.println("[FS] Mount failed — formatting LittleFS...");
-  if (!FS.format()) {
-    Serial.println("[FS] Format failed.");
-    return false;
-  }
-  Serial.println("[FS] Format OK, mounting...");
-  return FS.begin(false);
+  return FS.begin(true);
 }
 
 static size_t fsTotalBytesSafe() {
@@ -469,10 +451,10 @@ static const LayoutMetrics& getMetrics() {
 
 static void applyFontSize(int sz) {
   switch (sz) {
-    case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
+    case 6: MAIN_FONT = u8g2_font_6x13_t_cyrillic; BOLD_FONT = u8g2_font_6x13B_t_cyrillic; break;
     case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
-    case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
-    case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
+    case 8: MAIN_FONT = u8g2_font_8x13_t_cyrillic; BOLD_FONT = u8g2_font_10x20_t_cyrillic; break;
+    case 9: MAIN_FONT = u8g2_font_9x15_t_cyrillic; BOLD_FONT = u8g2_font_10x20_t_cyrillic; break;
     default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; sz = 10; break;
   }
   g_settings.fontSize = sz;
@@ -480,7 +462,7 @@ static void applyFontSize(int sz) {
 }
 
 static void loadSettings() {
-  applyFontSize(prefs.getInt("cfg_font", 8));
+  applyFontSize(prefs.getInt("cfg_font", 6));
 
   g_settings.sleepSecs = (uint32_t)prefs.getInt("cfg_sleep", 120);
   if (g_settings.sleepSecs < 10) g_settings.sleepSecs = 10;
@@ -516,10 +498,8 @@ static void clearButtonQueue() {
 void IRAM_ATTR btnISR() {
   uint8_t next = (uint8_t)((btnQHead + 1) % BTN_Q);
   if (next == btnQTail) {
-    // Queue full: drop the NEW event. Advancing btnQTail from the ISR would
-    // race ButtonState::poll() and deliver events out of order.
+    btnQTail = (uint8_t)((btnQTail + 1) % BTN_Q);
     g_isrDropCount++;
-    return;
   }
   btnQState[btnQHead] = (digitalRead(BTN) == LOW);
   btnQTimeMs[btnQHead] = isrNowMs();
@@ -560,7 +540,6 @@ void ButtonState::poll() {
           clickCount = 0;
           longClick = true;
         } else {
-          rawPressCount++;  // count every short press unconditionally
           clickCount++;
           lastRelease = edgeT;
           if (clickCount == 1) firstClickRelease = edgeT;
@@ -582,7 +561,7 @@ void ButtonState::poll() {
     else if (clickCount == 3) emit = (uint32_t)(now - firstClickRelease) > TRIPLE_MS;
 
     if (emit) {
-      if (clickCount == 1) shortClick  = true;
+      if (clickCount == 1) shortClick = true;
       else if (clickCount == 2) doubleClick = true;
       else if (clickCount == 3) tripleClick = true;
       clickCount = 0;
@@ -591,21 +570,9 @@ void ButtonState::poll() {
 }
 
 static void resetInputFrontend() {
-  // Wait for the button that triggered this transition (wake or triple-click)
-  // to be physically released, then debounce. This prevents that single press
-  // from leaking into the new mode as an accidental action.
-  // We do NOT clear the whole ISR queue — any presses that arrive AFTER
-  // release are intentional and should be processed normally.
-  uint32_t deadline = millis() + 600; // safety timeout
-  while (digitalRead(BTN) == LOW && (uint32_t)(millis()) < deadline) delay(1);
-  delay(DEBOUNCE_MS + 2); // minimal debounce after release
-
-  // Discard only events that happened BEFORE this moment (the transition press).
-  // Events queued after the release are kept.
-  noInterrupts();
-  uint8_t headNow = btnQHead;
-  interrupts();
-  btnQTail = headNow; // advance tail to head = discard old events only
+  while (digitalRead(BTN) == LOW) delay(5);
+  delay(DEBOUNCE_MS + 8);
+  clearButtonQueue();
   btns.resetState();
   markUserActivity();
 }
@@ -716,6 +683,31 @@ static void setFolderExpanded(int idx, bool expanded) {
   g_library.folderExpanded[idx] = expanded;
 }
 
+static int folderDepth(const String& relPath) {
+  if (relPath.length() == 0) return 0;
+  int depth = 0;
+  for (size_t i = 0; i < relPath.length(); i++) {
+    if (relPath[i] == '/') depth++;
+  }
+  return depth;
+}
+
+static bool areFolderAncestorsExpanded(const String& relPath) {
+  String parent = folderParent(relPath);
+  while (parent.length() > 0) {
+    bool found = false;
+    for (int i = 0; i < g_library.folderCount; i++) {
+      if (String(g_library.folders[i]) == parent) {
+        if (!g_library.folderExpanded[i]) return false;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+    parent = folderParent(parent);
+  }
+  return true;
+}
 
 static String bookLeafLabel(int idx) {
   String leaf = stripTxtExt(lastPathComponent(String(g_library.books[idx].path)));
@@ -901,6 +893,8 @@ static String prefKeyForBook(const String& path) {
   return String(buf);
 }
 
+
+
 static int savedPageForBookPath(const String& path) {
   String key = prefKeyForBook(path);
   int p = prefs.getInt((key + "_p").c_str(), 0);
@@ -964,88 +958,6 @@ static void savePageOffsetCacheForBook(const String& path, size_t fileSize) {
   f.close();
 }
 
-static void invalidateAllPageCaches() {
-  // Page offsets are computed from the current font size and line spacing.
-  // When either changes, page numbers stored in prefs are stale (page N at
-  // font 8 != page N at font 12), but the BYTE OFFSET of the reader's last
-  // position is layout-independent. We keep that offset (in pref key "_o")
-  // and set a "needs relocation" flag ("_n") so the next open of each book
-  // re-derives its page number from the byte offset in the new layout.
-  // For bookmarks we mirror the same byte-offset-is-truth approach: keep
-  // bmOffsets[] (those still point to the correct text after the layout
-  // change) and let the stored page number become a stale fallback used
-  // only by readBookmarkLabelAtOffset() when seek() fails.
-
-  // Capture the currently open book's byte offset BEFORE we wipe in-memory
-  // pageOffsets[]. saveProgressThrottled keeps "_o" reasonably current, but
-  // the user may have turned pages since the last throttle fire.
-  uint32_t openBookOffset = 0;
-  bool haveOpenBookOffset = false;
-  if (g_reader.currentBookKey.length() > 0
-      && g_reader.pageIndex >= 0
-      && g_reader.pageIndex < g_reader.knownPages) {
-    openBookOffset = g_reader.pageOffsets[g_reader.pageIndex];
-    haveOpenBookOffset = true;
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(), openBookOffset);
-  }
-
-  resetOffsetCache();
-
-  // Remove all on-disk page-cache files (pc_*.bin).
-  // f.name() on arduino-esp32 3.x returns the BASENAME (no leading slash),
-  // so check both forms and rebuild the absolute path before remove().
-  File root = FS.open("/");
-  if (root && root.isDirectory()) {
-    File f = root.openNextFile();
-    while (f) {
-      String n = String(f.name());
-      String absPath = n.startsWith("/") ? n : ("/" + n);
-      bool removeIt = (n.startsWith("pc_") || n.startsWith("/pc_")) && n.endsWith(".bin");
-      f.close();
-      if (removeIt) FS.remove(absPath);
-      f = root.openNextFile();
-    }
-    root.close();
-  } else if (root) {
-    root.close();
-  }
-
-  // Mark every book as needing relocation on next open. We keep "_p" as-is
-  // (it's a hint and harmless if "_n" path overrides it) and rely on "_o" +
-  // the new layout to derive the correct page in openBookByIndex.
-  // Bookmarks are intentionally NOT touched: bmOffsets[] are still valid
-  // byte positions in the same file, so navigation lands on the right text.
-  // The stored bmPages[] page numbers are stale but only used by
-  // readBookmarkLabelAtOffset() as a fallback label ("p. N") when seek
-  // fails; in normal use the label is derived from the text at bmOffsets[j].
-  for (int i = 0; i < g_library.bookCount; i++) {
-    String key = prefKeyForBook(String(g_library.books[i].path));
-    prefs.putBool((key + "_n").c_str(), true);
-  }
-
-  // For the currently open book, reset in-memory pagination and relocate
-  // straight away using the byte offset we just captured. This avoids the
-  // user seeing page 1 momentarily before the next render.
-  if (g_reader.currentBookPath.length() > 0) {
-    g_reader.knownPages = 1;
-    g_reader.pageOffsets[0] = 0;
-    g_reader.pageIndex = 0;
-    g_reader.eofReached = false;
-    resetSaveThrottle();
-    if (haveOpenBookOffset && g_reader.file) {
-      relocateOpenBookToOffset(openBookOffset);
-      if (g_reader.currentBookKey.length() > 0) {
-        prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-        if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-          prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                        g_reader.pageOffsets[g_reader.pageIndex]);
-        }
-        prefs.remove((g_reader.currentBookKey + "_n").c_str());
-      }
-    }
-  }
-}
-
 static void sanitizeListText(String& s) {
   s.replace("\r", "");
   s.replace("\n", " ");
@@ -1068,13 +980,13 @@ static void loadListItems() {
     if (pos + 1 + MAX_LIST_TEXT + 1 > got) break;
     g_list.items[i].done = buf[pos++];
     memcpy(g_list.items[i].text, &buf[pos], MAX_LIST_TEXT + 1);
-    g_list.items[i].text[MAX_LIST_TEXT] = '\0';
+    g_list.items[i].text[MAX_LIST_TEXT] = ' ';
     pos += (MAX_LIST_TEXT + 1);
     String t = String(g_list.items[i].text);
     sanitizeListText(t);
     if (t.length() == 0) continue;
     strncpy(g_list.items[g_list.count].text, t.c_str(), MAX_LIST_TEXT);
-    g_list.items[g_list.count].text[MAX_LIST_TEXT] = '\0';
+    g_list.items[g_list.count].text[MAX_LIST_TEXT] = ' ';
     g_list.items[g_list.count].done = g_list.items[i].done ? 1 : 0;
     g_list.count++;
   }
@@ -1090,10 +1002,6 @@ static void saveListItems() {
     strncpy((char*)&buf[pos], g_list.items[i].text, MAX_LIST_TEXT);
     pos += (MAX_LIST_TEXT + 1);
   }
-  // Skip the NVS write if nothing changed, to reduce flash wear.
-  uint8_t existing[1 + MAX_LIST_ITEMS * (1 + MAX_LIST_TEXT + 1)] = {0};
-  size_t got = prefs.getBytes("list_v1", existing, sizeof(existing));
-  if (got == pos && memcmp(existing, buf, pos) == 0) return;
   prefs.putBytes("list_v1", buf, pos);
 }
 
@@ -1130,10 +1038,10 @@ static void migrateBookMetadata(const String& oldPath, const String& newPath) {
     prefs.remove((oldKey + "_p").c_str());
   }
 
-  uint8_t buf[1 + MAX_BOOKMARKS * 6] = {0};
+  uint8_t buf[1 + MAX_BOOKMARKS * 2] = {0};
   size_t got = prefs.getBytes(bmKeyFor(oldKey).c_str(), buf, sizeof(buf));
   if (got > 0) {
-    prefs.putBytes(bmKeyFor(newKey).c_str(), buf, got);
+    prefs.putBytes(bmKeyFor(newKey).c_str(), buf, sizeof(buf));
     prefs.remove(bmKeyFor(oldKey).c_str());
   }
 
@@ -1232,51 +1140,20 @@ static void scanBooksRecursive(const String& absDir, const String& relDir) {
 }
 
 static void loadBooks() {
-  int savedListSel = g_list.selectedIndex;
-
-  char expandedBefore[MAX_FOLDERS][64];
-  int expandedCount = 0;
-  for (int i = 0; i < g_library.folderCount && expandedCount < MAX_FOLDERS; i++) {
-    if (g_library.folderExpanded[i]) {
-      strncpy(expandedBefore[expandedCount], g_library.folders[i], 63);
-      expandedBefore[expandedCount][63] = '\0';
-      expandedCount++;
-    }
-  }
-
   loadListItems();
-  if (g_list.count > 0) {
-    if (savedListSel >= g_list.count) savedListSel = g_list.count - 1;
-    if (savedListSel < 0) savedListSel = 0;
-    g_list.selectedIndex = savedListSel;
-  } else {
-    g_list.selectedIndex = 0;
-  }
-
   g_library.bookCount = 0;
   g_library.folderCount = 0;
   for (int i = 0; i < MAX_FOLDERS; i++) g_library.folderExpanded[i] = false;
   resetOffsetCache();
-
   ensureBooksDir();
   scanBooksRecursive("/books", "");
   sortFolders();
   sortBooks();
 
-  for (int i = 0; i < g_library.folderCount; i++) {
-    for (int j = 0; j < expandedCount; j++) {
-      if (strcmp(g_library.folders[i], expandedBefore[j]) == 0) {
-        g_library.folderExpanded[i] = true;
-        break;
-      }
-    }
-  }
-
-  buildLibraryEntries();
+  int maxItem = g_library.bookCount + 2;
   if (g_library.selectedItem < 0) g_library.selectedItem = 0;
-  if (g_library.selectedItem >= g_library.entryCount) g_library.selectedItem = max(0, g_library.entryCount - 1);
+  if (g_library.selectedItem > maxItem) g_library.selectedItem = maxItem;
 }
-
 
 static bool libraryFolderExists(const String& folderRel) {
   if (folderRel.length() == 0) return true;
@@ -1292,61 +1169,52 @@ static bool libraryFolderExists(const String& folderRel) {
 static String libraryEntryLabel(int idx) {
   if (idx < 0 || idx >= g_library.entryCount) return "";
   switch (g_library.entryTypes[idx]) {
-    case LIB_ENTRY_BACK:      return ".. Back";
+    case LIB_ENTRY_BACK:      return ".. Назад";
     case LIB_ENTRY_FOLDER: {
       int folderIdx = g_library.entryRefs[idx];
       String prefix = isFolderExpanded(folderIdx) ? "- " : "+ ";
       return prefix + folderLeafLabel(String(g_library.folders[folderIdx]));
     }
     case LIB_ENTRY_BOOK:      return bookLeafLabel(g_library.entryRefs[idx]);
-    case LIB_ENTRY_BOOKMARKS: return "Bookmarks";
-    case LIB_ENTRY_LIST:      return "List";
-    case LIB_ENTRY_ABOUT:     return "Device";
-    case LIB_ENTRY_UPLOAD:    return "Upload";
-    case LIB_ENTRY_APPS:      return "Apps";
+    case LIB_ENTRY_BOOKMARKS: return "Закладки";
+    case LIB_ENTRY_LIST:      return "Свой список";
+    case LIB_ENTRY_ABOUT:     return "Об устройстве";
+    case LIB_ENTRY_UPLOAD:    return "Загрузка по WIFI";
   }
   return "";
-}
-
-static void addLibraryBookEntry(int bookIdx, int depth) {
-  if (g_library.entryCount >= MAX_LIBRARY_ENTRIES) return;
-  g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_BOOK;
-  g_library.entryRefs[g_library.entryCount] = bookIdx;
-  g_library.entryDepths[g_library.entryCount] = depth;
-  g_library.entryCount++;
-}
-
-static void addLibraryFolderTree(const String& parent, int depth) {
-  for (int i = 0; i < g_library.folderCount && g_library.entryCount < MAX_LIBRARY_ENTRIES; i++) {
-    String folderRel = String(g_library.folders[i]);
-    if (folderParent(folderRel) != parent) continue;
-
-    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_FOLDER;
-    g_library.entryRefs[g_library.entryCount] = i;
-    g_library.entryDepths[g_library.entryCount] = depth;
-    g_library.entryCount++;
-
-    if (!isFolderExpanded(i)) continue;
-
-    for (int b = 0; b < g_library.bookCount && g_library.entryCount < MAX_LIBRARY_ENTRIES; b++) {
-      if (String(g_library.books[b].folder) == folderRel) {
-        addLibraryBookEntry(b, depth + 1);
-      }
-    }
-
-    addLibraryFolderTree(folderRel, depth + 1);
-  }
 }
 
 static void buildLibraryEntries() {
   g_library.entryCount = 0;
 
-  addLibraryFolderTree(String(""), 0);
+  for (int i = 0; i < g_library.folderCount && g_library.entryCount < MAX_LIBRARY_ENTRIES; i++) {
+    String folderRel = String(g_library.folders[i]);
+    if (!areFolderAncestorsExpanded(folderRel)) continue;
 
-  for (int b = 0; b < g_library.bookCount && g_library.entryCount < MAX_LIBRARY_ENTRIES; b++) {
-    if (String(g_library.books[b].folder).length() == 0) {
-      addLibraryBookEntry(b, 0);
+    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_FOLDER;
+    g_library.entryRefs[g_library.entryCount] = i;
+    g_library.entryDepths[g_library.entryCount] = folderDepth(folderRel);
+    g_library.entryCount++;
+  }
+
+  for (int i = 0; i < g_library.bookCount && g_library.entryCount < MAX_LIBRARY_ENTRIES; i++) {
+    String folderRel = String(g_library.books[i].folder);
+    if (folderRel.length() > 0) {
+      if (!areFolderAncestorsExpanded(folderRel)) continue;
+      bool folderOpen = false;
+      for (int f = 0; f < g_library.folderCount; f++) {
+        if (String(g_library.folders[f]) == folderRel) {
+          folderOpen = g_library.folderExpanded[f];
+          break;
+        }
+      }
+      if (!folderOpen) continue;
     }
+
+    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_BOOK;
+    g_library.entryRefs[g_library.entryCount] = i;
+    g_library.entryDepths[g_library.entryCount] = folderRel.length() ? (folderDepth(folderRel) + 1) : 0;
+    g_library.entryCount++;
   }
 
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
@@ -1368,12 +1236,6 @@ static void buildLibraryEntries() {
     g_library.entryCount++;
   }
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
-    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_APPS;
-    g_library.entryRefs[g_library.entryCount] = -1;
-    g_library.entryDepths[g_library.entryCount] = 0;
-    g_library.entryCount++;
-  }
-  if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_UPLOAD;
     g_library.entryRefs[g_library.entryCount] = -1;
     g_library.entryDepths[g_library.entryCount] = 0;
@@ -1383,7 +1245,6 @@ static void buildLibraryEntries() {
   if (g_library.selectedItem < 0) g_library.selectedItem = 0;
   if (g_library.selectedItem >= g_library.entryCount) g_library.selectedItem = max(0, g_library.entryCount - 1);
 }
-
 
 // ============================================================================
 //  Typography normalization / UTF-8 helpers / bookmark labels
@@ -1449,16 +1310,10 @@ static String normalizeTypography(const String& in) {
       continue;
     }
 
-    // 0xC2 0xAB = U+00AB <<  (left guillemet)
-    // 0xC2 0xBB = U+00BB >>  (right guillemet)
     if (b0 == 0xC2 && i + 1 < in.length()) {
       uint8_t b1 = (uint8_t)in[i + 1];
-      if (b1 == 0xAB || b1 == 0xBB) { out += '"'; i += 2; continue; }
-      // 0x91/0x92 are valid UTF-8 continuation bytes after 0xC2 (U+00D1, U+00D2)
-      // but not quote chars. Leave the old 0x91/0x92 branch: those are
-      // Windows-1252 smart quotes that sometimes leak through despite being
-      // technically invalid UTF-8; matching them defensively is harmless.
-      if (b1 == 0x91 || b1 == 0x92) { out += '\''; i += 2; continue; }
+      if (b1 == 0xAB || b1 == 0xBB || b1 == 0x93 || b1 == 0x94 || b1 == 0x84) { out += '"'; i += 2; continue; }
+      if (b1 == 0x91 || b1 == 0x92 || b1 == 0x82) { out += '\''; i += 2; continue; }
     }
 
     if (b0 == 0xE2 && i + 2 < in.length()) {
@@ -1480,18 +1335,12 @@ static String normalizeTypography(const String& in) {
 }
 
 // -------- Text compaction (storage optimization) --------
-// When called with state pointers, lastWasSpace / newlineCount are carried
-// across calls so streaming uploads collapse whitespace that spans chunk
-// boundaries. Pass trimTail=false on every chunk except the final one.
-static String compactText(const String& in,
-                          bool* ioLastWasSpace = nullptr,
-                          int* ioNewlineCount = nullptr,
-                          bool trimTail = true) {
+static String compactText(const String& in) {
   String out;
   out.reserve(in.length());
 
-  bool lastWasSpace = ioLastWasSpace ? *ioLastWasSpace : false;
-  int newlineCount = ioNewlineCount ? *ioNewlineCount : 0;
+  bool lastWasSpace = false;
+  int newlineCount = 0;
 
   for (size_t i = 0; i < in.length(); i++) {
     char c = in[i];
@@ -1523,14 +1372,9 @@ static String compactText(const String& in,
     out += c;
   }
 
-  if (ioLastWasSpace) *ioLastWasSpace = lastWasSpace;
-  if (ioNewlineCount) *ioNewlineCount = newlineCount;
-
-  if (trimTail) {
-    while (out.length() > 0 &&
-           (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
-      out.remove(out.length() - 1);
-    }
+  while (out.length() > 0 &&
+         (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
+    out.remove(out.length() - 1);
   }
 
   return out;
@@ -1590,7 +1434,7 @@ static String readBookmarkLabelAtOffset(File& f, uint32_t off, int page) {
 
   if (inWord) words++;
   label.trim();
-  if (label.length() == 0) label = "Page";
+  if (label.length() == 0) label = "Страница";
   label += " - p. ";
   label += String(page + 1);
   return label;
@@ -1614,12 +1458,6 @@ static void saveProgressThrottled(bool force = false) {
   }
 
   prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-  // Persist the byte offset of the current page so font / line-gap changes can
-  // re-locate the reader at the same text position in the new layout.
-  if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-    prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                  g_reader.pageOffsets[g_reader.pageIndex]);
-  }
   g_reader.lastSaveMs = millis();
   g_reader.lastSavedPage = g_reader.pageIndex;
 }
@@ -1680,7 +1518,7 @@ static const char* addBookmarkForCurrentBook() {
   uint8_t count = loadBookmarksForKey(g_reader.currentBookKey, pages, offsets);
 
   for (uint8_t i = 0; i < count; i++) {
-    if ((int)pages[i] == g_reader.pageIndex) return "Bookmark exists";
+    if ((int)pages[i] == g_reader.pageIndex) return "Сохраненные закладки";
   }
 
   uint32_t currentOffset = g_reader.lastPageStartOffset;
@@ -1714,7 +1552,7 @@ static const char* addBookmarkForCurrentBook() {
 
   saveBookmarksForKey(g_reader.currentBookKey, pages, offsets, count);
   if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
-  return "Bookmark saved";
+  return "Закладка сохранена";
 }
 
 // ============================================================================
@@ -1751,8 +1589,7 @@ static uint32_t readAdcMilliVoltsStable() {
   (void)analogReadMilliVolts(BAT_ADC_IN);
   delay(3);
 
-  // 11 samples, drop 2 low + 2 high, average 7 — accurate enough, ~20ms faster
-  const int N = 11;
+  const int N = 21;
   uint16_t vals[N];
   for (int i = 0; i < N; i++) {
     vals[i] = (uint16_t)analogReadMilliVolts(BAT_ADC_IN);
@@ -1763,8 +1600,8 @@ static uint32_t readAdcMilliVoltsStable() {
   qsort(vals, N, sizeof(vals[0]), cmpUint16);
 
   uint32_t sum = 0;
-  for (int i = 2; i < (N - 2); i++) sum += vals[i];
-  return sum / (uint32_t)(N - 4);
+  for (int i = 3; i < (N - 3); i++) sum += vals[i];
+  return sum / (uint32_t)(N - 6);
 }
 
 static float readBatteryVoltageRaw() {
@@ -2004,14 +1841,6 @@ static uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* 
     if (off <= startPos) off = startPos + 1;
     size_t sz = f.size();
     if (sz > 0 && off > sz) off = sz;
-    // Advance past UTF-8 continuation bytes (0b10xxxxxx) so the next page
-    // doesn't start mid-character. UTF-8 chars are at most 4 bytes.
-    for (int k = 0; k < 3 && off < sz; k++) {
-      if (!f.seek(off)) break;
-      int b = f.peek();
-      if (b < 0 || (b & 0xC0) != 0x80) break;
-      off++;
-    }
     return off;
   };
 
@@ -2132,9 +1961,7 @@ static uint32_t buildNextOffsetFor(File& f, uint32_t startPos) {
 
 static uint32_t buildNextOffset(uint32_t startPos) {
   uint32_t next = readPageFromFile(g_reader.file, startPos, false, nullptr);
-  // Use file size instead of available() for reliable EOF detection.
-  // available() is unreliable after internal seeks inside readPageFromFile.
-  if (next >= (uint32_t)g_reader.file.size()) g_reader.eofReached = true;
+  if (!g_reader.file.available()) g_reader.eofReached = true;
   return next;
 }
 
@@ -2161,11 +1988,6 @@ static uint32_t pageOffsetForPage(File& f, const String& path, int page) {
 }
 
 static void ensureOffsetsUpTo(int targetPage) {
-  if (g_reader.knownPages < 1) {
-    g_reader.knownPages = 1;
-    g_reader.pageOffsets[0] = 0;
-  }
-
   bool addedOffsets = false;
   while (!g_reader.eofReached && g_reader.knownPages <= targetPage && g_reader.knownPages < MAX_PAGES) {
     uint32_t start = g_reader.pageOffsets[g_reader.knownPages - 1];
@@ -2184,33 +2006,8 @@ static void ensureOffsetsUpTo(int targetPage) {
   if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
 
   if (addedOffsets && (g_reader.knownPages % 50 == 0 || g_reader.eofReached)) {
-    if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
   }
-}
-
-// Locate the page containing `targetOffset` in the current font layout, then
-// position pageIndex one page earlier than that containing page (a small
-// re-read so the user never skips past their last position). Walks pages
-// forward via ensureOffsetsUpTo(); falls back to the last known page on
-// EOF / MAX_PAGES cap. Pagination of a multi-MB book can take many seconds,
-// so we yield periodically to keep the task watchdog and HTTP server happy.
-static void relocateOpenBookToOffset(uint32_t targetOffset) {
-  if (targetOffset == 0) {
-    g_reader.pageIndex = 0;
-    return;
-  }
-
-  for (int k = 1; k < MAX_PAGES; k++) {
-    ensureOffsetsUpTo(k);
-    if ((k & 0x3F) == 0) yield();  // every 64 pages: feed WDT + service HTTP
-    if (g_reader.eofReached && (int)g_reader.knownPages <= k) break;
-    if (g_reader.pageOffsets[k] > targetOffset) {
-      int containing = k - 1;                                  // page that contains targetOffset
-      g_reader.pageIndex = (containing > 0) ? (containing - 1) : 0;  // one earlier, for re-read
-      return;
-    }
-  }
-  g_reader.pageIndex = (g_reader.knownPages > 0) ? (int)g_reader.knownPages - 1 : 0;
 }
 
 // ============================================================================
@@ -2234,22 +2031,8 @@ static bool openBookByIndex(int idx) {
   g_reader.pageOffsets[0] = 0;
   g_reader.eofReached = false;
   loadPageOffsetCacheForBook(path, g_reader.file.size());
-  // If the layout changed since this book was last open ("_n" set by
-  // invalidateAllPageCaches), re-derive the page from the saved byte offset
-  // instead of trusting the now-stale "_p" page number.
-  if (prefs.getBool((g_reader.currentBookKey + "_n").c_str(), false)) {
-    uint32_t target = prefs.getUInt((g_reader.currentBookKey + "_o").c_str(), 0);
-    relocateOpenBookToOffset(target);
-    prefs.remove((g_reader.currentBookKey + "_n").c_str());
-    prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
-    if (g_reader.pageIndex >= 0 && g_reader.pageIndex < g_reader.knownPages) {
-      prefs.putUInt((g_reader.currentBookKey + "_o").c_str(),
-                    g_reader.pageOffsets[g_reader.pageIndex]);
-    }
-  } else {
-    g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
-    if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
-  }
+  g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
+  if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
   g_reader.pageTurnsSinceFull = 0;
   resetSaveThrottle();
   syncWakeState(true);
@@ -2296,27 +2079,31 @@ static void drawStatusBar(uint32_t startOffset) {
 
 static void renderCurrentPage() {
   if (!g_reader.file && !reopenCurrentBookIfNeeded()) {
-    drawCenter("Open failed", "Back to library");
+    drawCenter("Open failed", "Returning to library");
+    delay(500);
     enterLibraryRoot(true);
     return;
   }
 
   if (!g_reader.file || g_reader.file.isDirectory()) {
-    drawCenter("Open failed", "Back to library");
+    drawCenter("Open failed", "Returning to library");
+    delay(500);
     enterLibraryRoot(true);
     return;
   }
 
   size_t bookSize = g_reader.file.size();
   if (bookSize == 0) {
-    drawCenter("Book empty", "Back to library");
+    drawCenter("Book empty", "Returning to library");
+    delay(500);
     enterLibraryRoot(true);
     return;
   }
 
   ensureOffsetsUpTo(g_reader.pageIndex);
   if (g_reader.knownPages <= 0) {
-    drawCenter("Book empty", "Back to library");
+    drawCenter("Book empty", "Returning to library");
+    delay(500);
     enterLibraryRoot(true);
     return;
   }
@@ -2363,14 +2150,16 @@ static const int UI_HEADER_GAP = 6;
 static const int UI_LIST_LEFT = MARGIN_X + 4;
 static const int UI_DEPTH_INDENT = 10;
 
-static int drawSectionHeader(const char* title) {
+static int drawSectionHeader(const char* title, bool bold = true) {
+  (void)bold;
+
   u8g2.setFont(BOLD_FONT);
   int ascent = u8g2.getFontAscent();
   int yTitle = UI_HEADER_TOP + ascent - 2;
 
   // Library = Pala One, other screens = their own title
   const char* headerText = "Pala One";
-  if (title && strcmp(title, "Library") != 0) {
+  if (title && strcmp(title, "Библиотека") != 0) {
     headerText = title;
   }
 
@@ -2447,7 +2236,7 @@ static void drawLibrary() {
   int ascent = u8g2.getFontAscent();
   int descent = u8g2.getFontDescent();
   int lineH = (ascent - descent) + g_settings.lineGap + 1;
-  int y = drawSectionHeader("Library");
+  int y = drawSectionHeader("Библиотека", true);
 
   int totalItems = g_library.entryCount;
   int visible = (SCREEN_H - y - BOT_PAD) / lineH;
@@ -2466,7 +2255,6 @@ static void drawLibrary() {
     bool isSystem = (g_library.entryTypes[idx] == LIB_ENTRY_BOOKMARKS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_LIST ||
                      g_library.entryTypes[idx] == LIB_ENTRY_ABOUT ||
-                     g_library.entryTypes[idx] == LIB_ENTRY_APPS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_UPLOAD);
     bool boldText = (idx == g_library.selectedItem);
     drawMenuBulletRow(y, label, idx == g_library.selectedItem, boldText, g_library.entryDepths[idx], isSystem);
@@ -2482,10 +2270,10 @@ static void drawListScreen() {
   int ascent = u8g2.getFontAscent();
   int descent = u8g2.getFontDescent();
   int lineH = (ascent - descent) + g_settings.lineGap + 1;
-  int y = drawSectionHeader("List");
+  int y = drawSectionHeader("Свой список", true);
 
   if (!listHasVisibleItems()) {
-    drawMenuBulletRow(y, "No items", true, false, 0, false);
+    drawMenuBulletRow(y, "Нет элементов", true, false, 0, false);
     display.update();
     return;
   }
@@ -2550,14 +2338,14 @@ static void drawAbout() {
   u8g2.setFont(MAIN_FONT);
   int ascent = u8g2.getFontAscent();
   int lineH = (ascent - u8g2.getFontDescent()) + g_settings.lineGap + 1;
-  int y = drawSectionHeader("Device");
+  int y = drawSectionHeader("Об устройстве", true);
 
   String rows[5] = {
-    "Firmware " FW_VERSION,
-    "1x next / down",
-    "2x open / select",
-    "3x home",
-    "Hold bookmark"
+    "Прошивка " FW_VERSION,
+    "1x далее / вниз",
+    "2x открыть / выбрать",
+    "3x домой",
+    "Зажать закладка"
   };
 
   for (int i = 0; i < 5; i++) {
@@ -2570,330 +2358,16 @@ static void drawAbout() {
   display.update();
 }
 
-static void scanApps() {
-  g_apps.count = 0;
-
-  if (!FS.exists("/apps")) {
-    FS.mkdir("/apps");
-    return;
-  }
-
-  File dir = FS.open("/apps");
-  if (!dir || !dir.isDirectory()) {
-    if (dir) dir.close();
-    return;
-  }
-
-  File f = dir.openNextFile();
-  while (f && g_apps.count < MAX_APPS) {
-    String entryName = String(f.name());
-    f.close();
-
-    if (!entryName.endsWith(".bin")) {
-      f = dir.openNextFile();
-      continue;
-    }
-
-    String absPath = entryName.startsWith("/") ? entryName : (String("/apps/") + entryName);
-    AppDiscovery& entry = g_apps.apps[g_apps.count];
-
-    File hf = FS.open(absPath, "r");
-    bool usedHeader = false;
-    if (hf && hf.size() >= sizeof(PalaAppHeader)) {
-      PalaAppHeader hdr;
-      if (hf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr) &&
-          hdr.magic == PALA_APP_MAGIC) {
-        hdr.name[MAX_APP_NAME] = '\0';
-        strncpy(entry.name, hdr.name, MAX_APP_NAME);
-        entry.name[MAX_APP_NAME] = '\0';
-        usedHeader = true;
-      }
-    }
-    if (hf) hf.close();
-
-    if (!usedHeader) {
-      String stem = lastPathComponent(absPath);
-      if (stem.endsWith(".bin")) stem = stem.substring(0, stem.length() - 4);
-      stem.replace('_', ' ');
-      strncpy(entry.name, stem.c_str(), MAX_APP_NAME);
-      entry.name[MAX_APP_NAME] = '\0';
-    }
-
-    strncpy(entry.path, absPath.c_str(), MAX_APP_PATH);
-    entry.path[MAX_APP_PATH] = '\0';
-    g_apps.count++;
-
-    f = dir.openNextFile();
-  }
-  if (f) f.close();
-  dir.close();
-
-  if (g_apps.selectedIndex >= g_apps.count) g_apps.selectedIndex = 0;
-}
-
-// ---- PalaAPI wrapper implementations ----------------------------------------
-
-static void api_clearScreen() {
-  prepareMenuFrame();
-}
-
-static void api_drawHeader(const char* title) {
-  drawSectionHeader(title);
-}
-
-static void api_drawTextAt(int x, int y, const char* text, int bold) {
-  u8g2.setFont(bold ? BOLD_FONT : MAIN_FONT);
-  u8g2.setCursor(x, y);
-  u8g2.print(text);
-}
-
-static void api_drawCenteredLarge(const char* text) {
-  u8g2.setFont(u8g2_font_helvB14_te);
-  int w   = u8g2.getUTF8Width(text);
-  int asc = u8g2.getFontAscent();
-  // centre horizontally; vertically centred in the space below y=20 (approx header height)
-  u8g2.setCursor((SCREEN_W - w) / 2, (SCREEN_H + 20 + asc) / 2);
-  u8g2.print(text);
-  u8g2.setFont(MAIN_FONT);
-}
-
-static void api_refreshDisplay() {
-  display.update();
-}
-
-static uint8_t api_waitForEvent() {
-  markUserActivity();
-  while (true) {
-    btns.poll();
-    // Long press fires while the button is still held (not on release).
-    if (btns.pressArmed && btns.stablePressed) {
-      uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-      if ((uint32_t)(now - btns.pressStart) >= LONG_MS) {
-        btns.pressArmed = false;
-        btns.pressStart = 0;
-        markUserActivity();
-        return PALA_LONG;
-      }
-    }
-    if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
-    if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
-    if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
-    delay(1);
-  }
-}
-
-static uint8_t api_pollEvent() {
-  btns.poll();
-  if (btns.longClick)   { btns.resetClicks(); markUserActivity(); return PALA_LONG; }
-  if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
-  if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
-  if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
-  return 0;
-}
-
-static uint32_t api_millisNow() {
-  return (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-static int api_buttonPressed() {
-  return btns.stablePressed ? 1 : 0;
-}
-
-static void api_delayMs(uint32_t ms) {
-  delay(ms);
-}
-
-static uint32_t api_pendingPresses() {
-  btns.poll();
-  uint32_t n = btns.rawPressCount;
-  btns.rawPressCount = 0;
-  return n;
-}
-
-static uint32_t api_rtcSeconds() {
-  return (uint32_t)(esp_rtc_get_time_us() / 1000000ULL);
-}
-
-static int api_storageRead(const char* key, void* buf, int maxlen) {
-  char path[64];
-  snprintf(path, sizeof(path), "/apps/%s.dat", key);
-  File f = LittleFS.open(path, "r");
-  if (!f) return -1;
-  int n = f.read((uint8_t*)buf, maxlen);
-  f.close();
-  return n;
-}
-
-static int api_storageWrite(const char* key, const void* buf, int len) {
-  char path[64];
-  snprintf(path, sizeof(path), "/apps/%s.dat", key);
-  File f = LittleFS.open(path, "w");
-  if (!f) return -1;
-  int n = f.write((const uint8_t*)buf, len);
-  f.close();
-  return n;
-}
-
-static int api_snprintf_wrap(char* buf, int len, const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  int r = vsnprintf(buf, (size_t)len, fmt, args);
-  va_end(args);
-  return r;
-}
-
-static void initPalaAPI() {
-  g_palaAPI.clearScreen       = api_clearScreen;
-  g_palaAPI.drawHeader        = api_drawHeader;
-  g_palaAPI.drawTextAt        = api_drawTextAt;
-  g_palaAPI.drawCenteredLarge = api_drawCenteredLarge;
-  g_palaAPI.refreshDisplay    = api_refreshDisplay;
-  g_palaAPI.waitForEvent      = api_waitForEvent;
-  g_palaAPI.snprintf_wrap     = api_snprintf_wrap;
-  g_palaAPI.pollEvent         = api_pollEvent;
-  g_palaAPI.millisNow         = api_millisNow;
-  g_palaAPI.buttonPressed     = api_buttonPressed;
-  g_palaAPI.delayMs           = api_delayMs;
-  g_palaAPI.pendingPresses    = api_pendingPresses;
-  g_palaAPI.storageRead       = api_storageRead;
-  g_palaAPI.storageWrite      = api_storageWrite;
-  g_palaAPI.rtcSeconds        = api_rtcSeconds;
-}
-
-// ---- App loader -------------------------------------------------------------
-
-static void freeAppExecBuf() {
-  if (g_appExecBuf) {
-    heap_caps_free(g_appExecBuf);
-    g_appExecBuf  = nullptr;
-    g_appExecSize = 0;
-  }
-}
-
-static bool loadAndRunApp(const char* path) {
-  freeAppExecBuf();
-
-  File f = FS.open(path, "r");
-  if (!f) { drawCenter("App not found", path); delay(1500); return false; }
-
-  size_t fileSize = f.size();
-  if (fileSize < sizeof(PalaAppHeader) + 4) {
-    f.close(); drawCenter("App too small", "Invalid file"); delay(1500); return false;
-  }
-
-  const size_t MAX_APP_BINARY = 48 * 1024;
-  if (fileSize > MAX_APP_BINARY) {
-    f.close(); drawCenter("App too large", "> 48 KB"); delay(1500); return false;
-  }
-
-  g_appExecBuf = heap_caps_malloc(fileSize, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
-  if (!g_appExecBuf) {
-    f.close();
-    char msg[32];
-    snprintf(msg, sizeof(msg), "Need %u bytes", (unsigned)fileSize);
-    drawCenter("No exec memory", msg);
-    delay(1500);
-    return false;
-  }
-  g_appExecSize = fileSize;
-
-  // heap_caps_malloc(MALLOC_CAP_EXEC) returns an IRAM instruction-bus address (0x403xxxxx).
-  // On ESP32-S3 that address is not writable from the data bus; use the DIRAM DRAM view
-  // (same physical SRAM, shifted by SOC_I_D_OFFSET) for all reads and writes.
-  uint8_t* dataBuf = (uint8_t*)MAP_IRAM_TO_DRAM((uint32_t)g_appExecBuf);
-
-  size_t bytesRead = f.read(dataBuf, fileSize);
-  f.close();
-  if (bytesRead != fileSize) {
-    freeAppExecBuf(); drawCenter("Read error", "Partial read"); delay(1500); return false;
-  }
-
-  PalaAppHeader* hdr = (PalaAppHeader*)dataBuf;
-
-  if (hdr->magic != PALA_APP_MAGIC) {
-    freeAppExecBuf(); drawCenter("Bad app file", "Wrong magic"); delay(1500); return false;
-  }
-  if (hdr->api_version != PALA_API_VERSION) {
-    char msg[32];
-    snprintf(msg, sizeof(msg), "API v%u, need v%u",
-             (unsigned)hdr->api_version, (unsigned)PALA_API_VERSION);
-    freeAppExecBuf(); drawCenter("API mismatch", msg); delay(1500); return false;
-  }
-
-  if (hdr->entry_offset < sizeof(PalaAppHeader) || hdr->entry_offset >= fileSize) {
-    freeAppExecBuf(); drawCenter("Bad entry offset", nullptr); delay(1500); return false;
-  }
-
-  // l32r uses the instruction bus (can reach IRAM), but firmware data loads use the data
-  // bus (cannot reach IRAM). Relocations must therefore resolve to DRAM addresses so that
-  // string/data pointers passed to firmware API functions are data-bus accessible.
-  uint32_t base = (uint32_t)dataBuf;
-  if (hdr->reloc_count > 0) {
-    if (hdr->reloc_offset < sizeof(PalaAppHeader) ||
-        hdr->reloc_offset + hdr->reloc_count * 4u > fileSize) {
-      freeAppExecBuf(); drawCenter("Bad reloc table", nullptr); delay(1500); return false;
-    }
-    uint32_t* relocs = (uint32_t*)(dataBuf + hdr->reloc_offset);
-    for (uint32_t i = 0; i < hdr->reloc_count; i++) {
-      uint32_t off = relocs[i];
-      if (off + 4u > hdr->reloc_offset) {
-        freeAppExecBuf(); drawCenter("Reloc out of range", nullptr); delay(1500); return false;
-      }
-      *(uint32_t*)(dataBuf + off) += base;
-    }
-  }
-
-  pala_app_entry_t entry = (pala_app_entry_t)((uint8_t*)g_appExecBuf + hdr->entry_offset);
-
-  resetInputFrontend();
-  entry(&g_palaAPI);
-
-  freeAppExecBuf();
-  resetInputFrontend();
-  return true;
-}
-
-// ---- Apps menu draw / handle ------------------------------------------------
-
-static void drawAppsMenu() {
-  prepareMenuFrame();
-  u8g2.setFont(MAIN_FONT);
-  int ascent  = u8g2.getFontAscent();
-  int descent = u8g2.getFontDescent();
-  int lineH   = (ascent - descent) + g_settings.lineGap + 1;
-  int y = drawSectionHeader("Apps");
-
-  if (g_apps.count == 0) {
-    drawMenuBulletRow(y, "No apps installed", true, false, 0, false);
-    display.update();
-    return;
-  }
-
-  int visible = max(2, (SCREEN_H - y - BOT_PAD) / lineH);
-  int top     = g_apps.selectedIndex - (visible / 2);
-  top = max(0, min(top, g_apps.count - visible));
-
-  for (int i = 0; i < visible; i++) {
-    int idx = top + i;
-    if (idx >= g_apps.count) break;
-    bool sel = (idx == g_apps.selectedIndex);
-    drawMenuBulletRow(y, String(g_apps.apps[idx].name), sel, sel, 0, false);
-    y += lineH;
-  }
-
-  display.update();
-}
-
 static void drawBookmarksBookSelect() {
   prepareMenuFrame();
   u8g2.setFont(MAIN_FONT);
   int ascent = u8g2.getFontAscent();
   int descent = u8g2.getFontDescent();
   int lineH = (ascent - descent) + g_settings.lineGap + 1;
-  int y = drawSectionHeader("Bookmarks");
+  int y = drawSectionHeader("Закладки", true);
 
   if (g_library.bookCount == 0) {
-    drawMenuBulletRow(y, "No books", true, false, 0, false);
+    drawMenuBulletRow(y, "Нет книг", true, false, 0, false);
     display.update();
     return;
   }
@@ -2925,7 +2399,7 @@ static void drawBookmarksList() {
   int ascent = u8g2.getFontAscent();
   int descent = u8g2.getFontDescent();
   int lineH = (ascent - descent) + g_settings.lineGap;
-  int y = drawSectionHeader("Bookmarks");
+  int y = drawSectionHeader("Закладки", true);
 
   String bookPath = String(g_library.books[g_bookmarkUi.bookIndex].path);
   String key = prefKeyForBook(bookPath);
@@ -2933,14 +2407,14 @@ static void drawBookmarksList() {
   if (g_bookmarkUi.selectedIndex >= (int)g_bookmarkUi.count) g_bookmarkUi.selectedIndex = max(0, (int)g_bookmarkUi.count - 1);
 
   if (g_bookmarkUi.count == 0) {
-    drawMenuBulletRow(y, "No bookmarks", true, false, 0, false);
+    drawMenuBulletRow(y, "Нет закладок", true, false, 0, false);
     display.update();
     return;
   }
 
   File f = FS.open(bookPath, "r");
   if (!f) {
-    drawMenuBulletRow(y, "Open failed", true, false, 0, false);
+    drawMenuBulletRow(y, "Не удалось открыть", true, false, 0, false);
     display.update();
     return;
   }
@@ -3077,7 +2551,7 @@ static int storageUsedPct() {
   return pct;
 }
 
-static String storageCardHtml(const char* title = "Storage") {
+static String storageCardHtml(const char* title = "Память") {
   size_t totalBytes = fsTotalBytesSafe();
   size_t usedBytes = fsUsedBytesSafe();
   size_t freeBytes = fsFreeBytesSafe();
@@ -3088,17 +2562,17 @@ static String storageCardHtml(const char* title = "Storage") {
   out += "<div class='card'><h2>";
   out += title;
   out += "</h2><div class='stats'>";
-  out += "<div class='stat'><span class='muted'>Books</span><b>" + String(g_library.bookCount) + "</b></div>";
-  out += "<div class='stat'><span class='muted'>Used</span><b>" + humanBytes(usedBytes) + "</b></div>";
-  out += "<div class='stat'><span class='muted'>Free</span><b>" + humanBytes(freeBytes) + "</b></div>";
-  out += "<div class='stat'><span class='muted'>Total</span><b>" + humanBytes(totalBytes) + "</b></div>";
+  out += "<div class='stat'><span class='muted'>Книги</span><b>" + String(g_library.bookCount) + "</b></div>";
+  out += "<div class='stat'><span class='muted'>Занято</span><b>" + humanBytes(usedBytes) + "</b></div>";
+  out += "<div class='stat'><span class='muted'>Свободно</span><b>" + humanBytes(freeBytes) + "</b></div>";
+  out += "<div class='stat'><span class='muted'>Всего</span><b>" + humanBytes(totalBytes) + "</b></div>";
   out += "</div><div class='bar'><span style='width:" + String(pct) + "%'></span></div>";
-  out += "<div class='muted' style='margin-top:8px'>" + String(pct) + "% of internal storage currently used.</div></div>";
+  out += "<div class='muted' style='margin-top:8px'>" + String(pct) + "% внутреннего хранилища занято.</div></div>";
   return out;
 }
 
 static String successPage(const String& title, const String& subtitle, const String& banner, const String& innerHtml) {
-  String out = webPageStart(title, subtitle, "<a href='/'>Home</a><a href='/files'>Files</a><a href='/settings'>Settings</a>");
+  String out = webPageStart(title, subtitle, "<a href='/'>Домой</a><a href='/files'>Файлы</a><a href='/settings'>Настройки</a>");
   out += "<div class='banner-ok'>" + banner + "</div>";
   out += innerHtml;
   out += webPageEnd();
@@ -3144,11 +2618,11 @@ static void handleRoot() {
   size_t usedBytes = FS.usedBytes();
   size_t freeBytes = (totalBytes >= usedBytes) ? (totalBytes - usedBytes) : 0;
 
-  String subtitle = "Firmware ";
+  String subtitle = "Прошивка ";
   subtitle += FW_VERSION;
   subtitle += " &middot; ";
   subtitle += String(g_library.bookCount);
-  subtitle += " books &middot; Free: ";
+  subtitle += " книг &middot; Свободно: ";
   subtitle += humanBytes(freeBytes);
   subtitle += " / ";
   subtitle += humanBytes(totalBytes);
@@ -3156,33 +2630,20 @@ static void handleRoot() {
   String out = webPageStart(
     "Pala One",
     subtitle,
-    "<a href='/files'>Files</a><a href='/bookmarks'>Bookmarks</a><a href='/list'>List</a><a href='/settings'>Settings</a><a href='/reset'>Factory reset</a>"
+    "<a href='/files'>Файлы</a><a href='/bookmarks'>Закладки</a><a href='/list'>Список</a><a href='/settings'>Настройки</a><a href='/reset'>Сброос</a>"
   );
 
   out += storageCardHtml();
 
-  if (fsTotalBytesSafe() == 0 || fsFreeBytesSafe() < 8192) {
-    out += "<div class='banner-warn'>&#9888; Storage is not available or almost full. If uploads fail, delete books or use Factory reset from this web UI.</div>";
-  }
-
   out +=
-    "<div class='card'><h2>Upload book</h2>"
-    "<p class='muted'>Send UTF-8 plain text files to <b>/books</b> on the device, then sort them into folders from the Files page.</p>"
+    "<div class='card'><h2>Загрузить книгу</h2>"
+    "<p class='muted'>Загрузите текстовые файлы без разметки в формате UTF-8  в папку <b>/books</b> на устройство, затем отсортируйте их на странице Файлы.</p>"
     "<form method='POST' action='/upload' enctype='multipart/form-data' accept-charset='UTF-8' style='margin-top:14px'>"
     "<input type='file' name='file' accept='.txt,text/plain' required>"
-    "<div class='actions'><button type='submit'>Upload</button><a class='btn secondary' href='/files'>Manage files</a></div>"
+    "<div class='actions'><button type='submit'>Загрузка</button><a class='btn secondary' href='/files'>Управление файлами</a></div>"
     "</form></div>";
 
-  out +=
-    "<div class='card'><h2>Upload app (.bin)</h2>"
-    "<p class='muted'>Upload a Pala app binary compiled with the Pala SDK. "
-    "Files are stored in <b>/apps/</b> and appear in the Apps menu on the device.</p>"
-    "<form method='POST' action='/upload-app' enctype='multipart/form-data' style='margin-top:14px'>"
-    "<input type='file' name='file' accept='.bin,application/octet-stream' required>"
-    "<div class='actions'><button type='submit'>Upload app</button></div>"
-    "</form></div>";
-
-  out += "<div class='card'><h2>Notes</h2><p class='muted'>Uploaded books are normalized and compacted before saving, so a source TXT can be larger than the final stored file. The reader is optimized for UTF-8 plain text and Latin-based languages.</p></div>";
+  out += "<div class='card'><h2>Примечание</h2><p class='muted'>Загруженные книги нормализуются и сжимаются перед сохранением, поэтому исходный TXT-файл может быть больше, чем итоговый сохраненный файл. Программа оптимизирована для чтения обычного текста в кодировке UTF-8.</p></div>";
 
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
@@ -3191,42 +2652,41 @@ static void handleRoot() {
 static void handleFiles() {
   loadBooks();
   String out = webPageStart(
-    "Files",
-    "Manage books, folders and library structure for Pala One.",
-    "<a href='/'>Home</a><a href='/bookmarks'>Bookmarks</a><a href='/settings'>Settings</a>",
+    "Файлы",
+    "Управлять книгами, папками и структурой библиотеки Pala One.",
+    "<a href='/'>Домой</a><a href='/bookmarks'>Закладки</a><a href='/settings'>Настройки</a>",
     true
   );
 
   out +=
-    "<div class='card'><h2>Create folder</h2>"
+    "<div class='card'><h2>Создать папку</h2>"
     "<form method='POST' action='/mkdir' class='stack' accept-charset='UTF-8' style='margin-top:12px'>"
-    "<input type='text' name='folder' placeholder='books or classics/english' maxlength='64'>"
-    "<div class='actions'><button type='submit'>Create folder</button><span class='muted'>Folders live inside /books.</span></div>"
+    "<input type='text' name='folder' placeholder='можно задать путь с /' maxlength='64'>"
+    "<div class='actions'><button type='submit'>Создать папку</button><span class='muted'>Папки находятся внутри /books.</span></div>"
     "</form></div>";
 
-  out += "<div class='card'><h2>Folders</h2>";
+  out += "<div class='card'><h2>Папки</h2>";
   if (g_library.folderCount == 0) {
-    out += "<p class='muted'>No folders yet. Books currently live in the root of /books.</p>";
+    out += "<p class='muted'>Еще нет папок. Книги находятся в корне /books.</p>";
   } else {
     out += "<ul class='list'>";
     for (int i = 0; i < g_library.folderCount; i++) {
       out += "<li><div class='row'><div><span class='pill'>";
       out += htmlEscape(prettyRelativeLabel(String(g_library.folders[i])));
-      out += "<span></span></div><div><form method='POST' action='/rmdir' style='display:inline'>";
-      out += "<input type='hidden' name='folder' value='";
+      out += "</span></div><div><a class='link' href='/rmdir?folder=";
       out += htmlEscape(g_library.folders[i]);
-      out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete folder? Only empty folders can be deleted.')\">Delete</button></form></div></div></li>";
+      out += "' onclick=\"return confirm('Удалить папку? Можно удалять только пустые папки.')\">Удалить</a></div></div></li>";
     }
     out += "</ul>";
   }
   out += "</div>";
 
-  out += "<div class='card'><h2>Library files</h2>";
-  if (g_library.bookCount >= MAX_BOOKS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Library full (80 books max). Delete books to make room.</p>";
-  if (g_library.folderCount >= MAX_FOLDERS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Folder limit reached (32 max).</p>";
+  out += "<div class='card'><h2>Файлы библиотеки</h2>";
+  if (g_library.bookCount >= MAX_BOOKS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Библиотека заполнена (80 книг максимум). Удалите книги, чтобы освободить место.</p>";
+  if (g_library.folderCount >= MAX_FOLDERS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Достигнут лимит папок (32 максимиум).</p>";
 
   if (g_library.bookCount == 0) {
-    out += "<p class='muted'>No books uploaded yet.</p>";
+    out += "<p class='muted'>Книги еще не загружены.</p>";
   } else {
     out += "<ul class='list'>";
     for (int i = 0; i < g_library.bookCount; i++) {
@@ -3239,77 +2699,28 @@ static void handleFiles() {
       out += htmlEscape(String(g_library.books[i].name));
       out += "</h3><div class='meta'>";
       out += String((int)g_library.books[i].size);
-      out += " bytes &middot; folder: ";
+      out += " байт &middot; папка: ";
       out += htmlEscape(folderLabel);
-      out += " &middot; current page: ";
+      out += " &middot; текущая страница: ";
       out += String(savedPage);
       out += "</div>";
 
       out += "<form method='POST' action='/jumppage' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
       out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div></div>";
-      out += "<div class='muted'>Set the page that should open next on the device.<br><span class='muted'>The first open may take a moment.</span></div></form>";
+      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Страница'></div><div><button type='submit'>Переход на страницу</button></div></div>";
+      out += "<div class='muted'>Задайте страницу для перехода на устройстве.<br><span class='muted'>Первое открытие может занять время.</span></div></form>";
 
       out += "<form method='POST' action='/move' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
       out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<input type='text' name='folder' value='" + htmlEscape(String(g_library.books[i].folder)) + "' placeholder='leave blank for root' maxlength='64'>";
-      out += "<div class='actions'><button type='submit'>Move</button><span class='muted'>Use the exact folder path.</span></div></form></div>";
-      out += "<div><form method='POST' action='/del' style='display:inline'><input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<button type='submit' class='btn secondary' onclick=\"return confirm('Delete file?')\">Delete</button></form></div></div></li>";
+      out += "<input type='text' name='folder' value='" + htmlEscape(String(g_library.books[i].folder)) + "' placeholder='оставьте пустым для корневой папки' maxlength='64'>";
+      out += "<div class='actions'><button type='submit'>Переместить</button><span class='muted'>Используйте точный путь к папке.</span></div></form></div><div><a class='link' href='/del?id=" + String(i) + "' onclick=\"return confirm('Удалить файл?')\">Удалить</a></div></div></li>";
     }
     out += "</ul>";
   }
 
   out += "</div>";
-
-  out += "<div class='card'><h2>Apps</h2>";
-  {
-    File appsDir = FS.open("/apps");
-    bool anyApp = false;
-    if (appsDir) {
-      File f = appsDir.openNextFile();
-      while (f) {
-        String name = String(f.name());
-        if (name.endsWith(".bin")) {
-          if (!anyApp) { out += "<ul class='list'>"; anyApp = true; }
-          out += "<li><div class='row'><div><h3>";
-          out += htmlEscape(name);
-          out += "</h3><div class='meta'>";
-          out += String((int)f.size());
-          out += " bytes</div></div><div><form method='POST' action='/del-app' style='display:inline'>";
-          out += "<input type='hidden' name='name' value='";
-          out += htmlEscape(name);
-          out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete app?')\">Delete</button></form></div></div></li>";
-        }
-        f.close();
-        f = appsDir.openNextFile();
-      }
-      appsDir.close();
-    }
-    if (!anyApp) out += "<p class='muted'>No apps installed.</p>";
-    else out += "</ul>";
-  }
-  out += "</div>";
-
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleDeleteApp() {
-  if (!server.hasArg("name")) {
-    server.send(400, "text/plain; charset=utf-8", "missing name");
-    return;
-  }
-  String name = server.arg("name");
-  // reject anything with path separators
-  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || !name.endsWith(".bin")) {
-    server.send(400, "text/plain; charset=utf-8", "invalid name");
-    return;
-  }
-  String path = "/apps/" + name;
-  FS.remove(path);
-  server.sendHeader("Location", "/files");
-  server.send(303);
 }
 
 static void handleDelete() {
@@ -3473,9 +2884,7 @@ static void handleJumpPageWeb() {
     if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
     resetSaveThrottle();
     saveProgressThrottled(true);
-    if (g_reader.file) {
-      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
-    }
+    savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
   }
 
   server.sendHeader("Location", "/files");
@@ -3484,7 +2893,7 @@ static void handleJumpPageWeb() {
 
 static void handleUploadDone() {
   if (!g_upload.bookOk) {
-    server.send(400, "text/plain; charset=utf-8", g_upload.bookError.length() ? g_upload.bookError : "Upload failed");
+    server.send(400, "text/plain; charset=utf-8", g_upload.bookError.length() ? g_upload.bookError : "Загрузка не удалась");
     return;
   }
 
@@ -3503,18 +2912,18 @@ static void handleUploadDone() {
 
   String inner;
   inner.reserve(1200);
-  inner += "<div class='card'><h2>Upload complete</h2><p class='muted'>Your book is now stored on the device and available in the library.</p>";
+  inner += "<div class='card'><h2>Upload complete</h2><p class='muted'>Ваша книга успешно сохранена на устройстве.</p>";
   inner += "<div class='stats'>";
-  inner += "<div class='stat'><span class='muted'>Book</span><b>" + htmlEscape(g_upload.bookFinalName) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Stored size</span><b>" + humanBytes(storedSize) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Books now</span><b>" + String(g_library.bookCount) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Free space</span><b>" + humanBytes(freeBytes) + "</b></div>";
-  inner += "</div><div class='actions'><a class='btn' href='/'>Upload another</a><a class='btn secondary' href='/files'>Open files</a></div></div>";
+  inner += "<div class='stat'><span class='muted'>Книга</span><b>" + htmlEscape(g_upload.bookFinalName) + "</b></div>";
+  inner += "<div class='stat'><span class='muted'>Занято size</span><b>" + humanBytes(storedSize) + "</b></div>";
+  inner += "<div class='stat'><span class='muted'>Книг всего</span><b>" + String(g_library.bookCount) + "</b></div>";
+  inner += "<div class='stat'><span class='muted'>Свободно</span><b>" + humanBytes(freeBytes) + "</b></div>";
+  inner += "</div><div class='actions'><a class='btn' href='/'>Загрузить еще</a><a class='btn secondary' href='/files'>Открыть файлы</a></div></div>";
   inner += storageCardHtml();
 
   String page = successPage(
-    "Upload complete",
-    "Book saved successfully.",
+    "Загрузка завершена",
+    "Книга сохранена в блиотеке.",
     "&#10003; Upload finished. No more blank status page.",
     inner
   );
@@ -3524,13 +2933,13 @@ static void handleUploadDone() {
 static void handleBookmarksWeb() {
   loadBooks();
   String out = webPageStart(
-    "Bookmarks",
-    "Saved reading positions for Pala One, grouped by book.",
-    "<a href='/'>Home</a><a href='/files'>Files</a><a href='/settings'>Settings</a>",
+    "Закладки",
+    "Сохраненные места в Pala One, сгруппированные по книге.",
+    "<a href='/'>Домой</a><a href='/files'>Файлы</a><a href='/settings'>Настройки</a>",
     true
   );
 
-  if (g_library.bookCount == 0) out += "<div class='card'><p class='muted'>No books available yet.</p></div>";
+  if (g_library.bookCount == 0) out += "<div class='card'><p class='muted'>Еще нет книг.</p></div>";
 
   for (int i = 0; i < g_library.bookCount; i++) {
     String bookPath = String(g_library.books[i].path);
@@ -3544,13 +2953,13 @@ static void handleBookmarksWeb() {
     out += "</h2>";
 
     if (count == 0) {
-      out += "<p class='muted'>No bookmarks</p></div>";
+      out += "<p class='muted'>Нет закладок</p></div>";
       continue;
     }
 
     File f = FS.open(bookPath, "r");
     if (!f) {
-      out += "<p class='muted'>Open failed</p></div>";
+      out += "<p class='muted'>Не удалось открыть</p></div>";
       continue;
     }
 
@@ -3562,19 +2971,15 @@ static void handleBookmarksWeb() {
 
       uint32_t pageOff = resolveBookmarkOffset(bookPath, (uint16_t)targetPage, offsets[j]);
       String sn = readBookmarkLabelAtOffset(f, pageOff, targetPage);
-      out += "<li><div class='row'><div><div class='pill'>Bookmark ";
+      out += "<li><div class='row'><div><div class='pill'>Закладка ";
       out += String(j + 1);
       out += "</div><p class='meta' style='margin-top:8px'>";
       out += htmlEscape(sn);
       out += "</p></div><div><a class='link' href='/viewbm?book=" + String(i) + "&idx=" + String(j) + "'>View</a> | ";
-      out += "<form method='POST' action='/delbm' style='display:inline'>";
-      out += "<input type='hidden' name='book' value='" + String(i) + "'>";
-      out += "<input type='hidden' name='idx' value='" + String(j) + "'>";
-      out += "<button type='submit' class='btn secondary' style='padding:4px 8px;font-size:13px' onclick=\"return confirm('Delete bookmark?')\">Delete</button>";
-      out += "</form></div></div></li>";
+      out += "<a class='link' href='/delbm?book=" + String(i) + "&idx=" + String(j) + "' onclick=\"return confirm('Удалить закладку?')\">Удалить</a></div></div></li>";
     }
 
-    out += "</ul><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(i) + "'>Download all bookmarks</a></div></div>";
+    out += "</ul><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(i) + "'>Скачать все закладки</a></div></div>";
     f.close();
   }
 
@@ -3654,19 +3059,19 @@ static void handleViewBookmarkWeb() {
     if (txt.length() == 0) txt = "(empty)";
   }
   String out = webPageStart(
-    "Bookmark View",
-    "Preview the saved page text for this bookmark.",
-    "<a href='/bookmarks'>&#8592; Back</a><a href='/files'>Files</a><a href='/'>Home</a>",
+    "Просмотр закладки",
+    "Просмотреть текст закладки.",
+    "<a href='/bookmarks'>&#8592; Назад</a><a href='/files'>Файлы</a><a href='/'>Домой</a>",
     true
   );
 
   out += "<div class='card'><h2>";
   out += htmlEscape(String(g_library.books[b].name));
-  out += "</h2><p class='muted'>Bookmark ";
+  out += "</h2><p class='muted'>Закладка ";
   out += String(idx + 1);
   out += "</p><pre class='pre'>";
   out += htmlEscape(txt);
-  out += "</pre><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(b) + "'>Download all bookmarks</a></div></div>";
+  out += "</pre><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(b) + "'>Скачать все закладки</a></div></div>";
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
 }
@@ -3764,15 +3169,15 @@ static void doFactoryReset() {
 
 static void handleResetConfirm() {
   String out = webPageStart(
-    "Factory Reset",
-    "Erase all books, bookmarks, progress, and custom assets.",
-    "<a href='/'>Back</a>"
+    "Сброс к заводским настройкам",
+    "Удалить все книги, закладки, прогресс чтения и другие сохраненные данные.",
+    "<a href='/'>Назад</a>"
   );
   out +=
     "<div class='card'><h2>Confirm reset</h2>"
-    "<p><strong>This will delete ALL books, bookmarks and reading progress.</strong></p>"
-    "<p class='muted'>The device filesystem will be formatted and settings will return to defaults.</p>"
-    "<form method='POST' action='/reset' style='margin-top:14px'><button class='danger' type='submit'>Yes, reset</button></form>"
+    "<p><strong>Будут удалены ВСЕ книги, закладки и прогресс чтения.</strong></p>"
+    "<p class='muted'>Файловая система будет очищена и будут установлены настройки по умолчанию.</p>"
+    "<form method='POST' action='/reset' style='margin-top:14px'><button class='danger' type='submit'>Да, сбрасываем</button></form>"
     "</div>";
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
@@ -3783,13 +3188,13 @@ static void handleResetDo() {
 
   String inner;
   inner.reserve(600);
-  inner += "<div class='card'><h2>Factory reset complete</h2><p class='muted'>All books, bookmarks, progress and custom assets were removed. The device is now back to a clean state.</p><div class='actions'><a class='btn' href='/'>Go to home</a><a class='btn secondary' href='/files'>Open files</a></div></div>";
+  inner += "<div class='card'><h2>Сброс к заводским настройкам завершен</h2><p class='muted'>Были удалены все книги, закладки и прогресс чтения. Память устройства очищена.</p><div class='actions'><a class='btn' href='/'>Домой</a><a class='btn secondary' href='/files'>Открыть файлы</a></div></div>";
   inner += storageCardHtml();
 
   String page = successPage(
-    "Reset complete",
-    "Pala One was reset successfully.",
-    "&#10003; Factory reset complete.",
+    "Сброс завершен",
+    "Pala One успешно сброшен заводским настройкам.",
+    "&#10003; Сброс к заводским настройкам завершен.",
     inner
   );
   server.send(200, "text/html; charset=utf-8", page);
@@ -3798,20 +3203,20 @@ static void handleResetDo() {
 static void handleListWeb() {
   loadListItems();
   String out = webPageStart(
-    "List",
-    "Create a simple shopping or to-do list for Pala One.",
-    "<a href='/'>Home</a><a href='/files'>Files</a><a href='/bookmarks'>Bookmarks</a><a href='/settings'>Settings</a>",
+    "Список",
+    "Создать простой список на Pala One.",
+    "<a href='/'>Домой</a><a href='/files'>Файлы</a><a href='/bookmarks'>Закладки</a><a href='/settings'>Настройки</a>",
     true
   );
 
-  out += "<div class='card'><h2>Edit list</h2><p class='muted'>Items appear on the device only when at least one line contains text. Hold the button on the device to mark an item as done.</p>";
+  out += "<div class='card'><h2>Edit list</h2><p class='muted'>Элементы отображаются на устройстве только в том случае, если хотя бы одна строка содержит текст. Удерживайте кнопку на устройстве, чтобы отметить элемент как выполненный.</p>";
   out += "<form method='POST' action='/list' class='stack' accept-charset='UTF-8' style='margin-top:12px'>";
   for (int i = 0; i < MAX_LIST_ITEMS; i++) {
     String value = (i < g_list.count) ? htmlEscape(String(g_list.items[i].text)) : String("");
     String checked = (i < g_list.count && g_list.items[i].done) ? " checked" : "";
-    out += "<div class='row' style='align-items:center;gap:10px'><div style='width:26px;text-align:center'><input type='checkbox' name='done" + String(i) + "' value='1'" + checked + "></div><div style='flex:1'><input type='text' name='item" + String(i) + "' value='" + value + "' maxlength='64' placeholder='List item'></div></div>";
+    out += "<div class='row' style='align-items:center;gap:10px'><div style='width:26px;text-align:center'><input type='checkbox' name='done" + String(i) + "' value='1'" + checked + "></div><div style='flex:1'><input type='text' name='item" + String(i) + "' value='" + value + "' maxlength='64' placeholder='Пункт списка'></div></div>";
   }
-  out += "<div class='actions'><button type='submit'>Save list</button><button type='submit' formaction='/list-clear-done'>Delete checked items</button><span class='muted'>Blank rows are ignored. Checked rows can be removed directly.</span></div></form></div>";
+  out += "<div class='actions'><button type='submit'>Сохранить список</button><button type='submit' formaction='/list-clear-done'>Удалить выбранные пункты</button><span class='muted'>Пустые строки игнорируются. Отмеченные строки можно удалить напрямую.</span></div></form></div>";
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
 }
@@ -3828,7 +3233,7 @@ static void handleListSaveWeb() {
     sanitizeListText(text);
     if (text.length() == 0) continue;
     strncpy(newList.items[newList.count].text, text.c_str(), MAX_LIST_TEXT);
-    newList.items[newList.count].text[MAX_LIST_TEXT] = '\0';
+    newList.items[newList.count].text[MAX_LIST_TEXT] = ' ';
     newList.items[newList.count].done = server.hasArg(doneName) ? 1 : 0;
     newList.count++;
     if (newList.count >= MAX_LIST_ITEMS) break;
@@ -3858,7 +3263,7 @@ static void handleListClearDoneWeb() {
     if (server.hasArg(doneName)) continue;  // checked in web UI => delete it
 
     strncpy(newList.items[newList.count].text, text.c_str(), MAX_LIST_TEXT);
-    newList.items[newList.count].text[MAX_LIST_TEXT] = '\0';
+    newList.items[newList.count].text[MAX_LIST_TEXT] = ' ';
     newList.items[newList.count].done = 0;
     newList.count++;
     if (newList.count >= MAX_LIST_ITEMS) break;
@@ -3873,10 +3278,10 @@ static void handleListClearDoneWeb() {
 }
 
 static void handleSettings() {
-  String sel8 = (g_settings.fontSize == 8) ? " selected" : "";
+  String sel6 = (g_settings.fontSize == 6) ? " selected" : "";
   String sel10 = (g_settings.fontSize == 10) ? " selected" : "";
-  String sel12 = (g_settings.fontSize == 12) ? " selected" : "";
-  String sel14 = (g_settings.fontSize == 14) ? " selected" : "";
+  String sel8 = (g_settings.fontSize == 8) ? " selected" : "";
+  String sel9 = (g_settings.fontSize == 9) ? " selected" : "";
 
   String ss30 = (g_settings.sleepSecs == 30) ? " selected" : "";
   String ss60 = (g_settings.sleepSecs == 60) ? " selected" : "";
@@ -3897,7 +3302,7 @@ static void handleSettings() {
   out =
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Settings</title>"
+    "<title>Настройки</title>"
     "<style>"
     "body{margin:0;background:#f3efe7;color:#1f2328;font:15px/1.45 system-ui,sans-serif}"
     ".wrap{max-width:760px;margin:0 auto;padding:18px}"
@@ -3918,101 +3323,75 @@ static void handleSettings() {
     "p{margin:0 0 10px}"
     "@media(min-width:620px){.grid.cols-2{grid-template-columns:1fr 1fr}}"
     "</style></head><body><div class='wrap'>"
-    "<div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><a href='/'>&#8592; Home</a></div>"
-    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>"
-    "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
-  out += "<option value='10'"; out += sel10; out += ">10px &mdash; small</option>";
-  out += "<option value='12'"; out += sel12; out += ">12px &mdash; medium</option>";
-  out += "<option value='14'"; out += sel14; out += ">14px &mdash; large</option>";
+    "<div class='top'><div><h1>Настройки Pala One</h1><div class='muted'>Прошивка " FW_VERSION " Конфигурация устройства.</div></div><a href='/'>&#8592; Домой</a></div>"
+    "<div class='card'><h2>Параметры текста</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Размер шрифта</label><select id='font' name='font'>"
+    "<option value='6'"; out += sel6; out += ">6px &mdash; маленький кириллический</option>";
+  out += "<option value='10'"; out += sel10; out += ">10px &mdash; маленький лтинский</option>";
+  out += "<option value='8'"; out += sel8; out += ">8px &mdash; средний кириллический</option>";
+  out += "<option value='9'"; out += sel9; out += ">9px &mdash; большой кириллический</option>";
   out +=
-    "</select><div class='hint'>Controls how many lines fit on each page.</div></div>"
-    "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
-    "<option value='30'"; out += ss30; out += ">30 seconds</option>";
-  out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
-  out += "<option value='120'"; out += ss120; out += ">2 minutes</option>";
-  out += "<option value='300'"; out += ss300; out += ">5 minutes</option>";
-  out += "<option value='600'"; out += ss600; out += ">10 minutes</option>";
-  out += "<option value='1800'"; out += ss1800; out += ">30 minutes</option>";
-  out += "</select><div class='hint'>Auto-sleep keeps battery draw low while idle.</div></div>";
-  out += "<div><label for='lgap'>Line spacing</label><select id='lgap' name='lgap'>";
-  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
-  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
-  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
-  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
+    "</select><div class='hint'>Меняет количество строк на странице.</div></div>"
+    "<div><label for='sleep'>Сон после</label><select id='sleep' name='sleep'>"
+    "<option value='30'"; out += ss30; out += ">30 секунд</option>";
+  out += "<option value='60'"; out += ss60; out += ">1 минута</option>";
+  out += "<option value='120'"; out += ss120; out += ">2 минуты</option>";
+  out += "<option value='300'"; out += ss300; out += ">5 минут</option>";
+  out += "<option value='600'"; out += ss600; out += ">10 минут</option>";
+  out += "<option value='1800'"; out += ss1800; out += ">30 минут</option>";
+  out += "</select><div class='hint'>Автоматический уход в сон экономит заряд.</div></div>";
+  out += "<div><label for='lgap'>Интервал между строками</label><select id='lgap' name='lgap'>";
+  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; компактный</option>";
+  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; нормальный</option>";
+  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; свободный</option>";
+  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; широкий</option>";
   out +=
-    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
+    "</select><div class='hint'>Небольшие изменения помогут настроить удобство чтения.</div></div>"
     "</div>"
-    "<div class='actions' style='margin-top:24px;'><button type='submit'>Save settings</button><span class='muted'>No extra files, scripts, or fonts.</span></div></form></div>"
-    "<div class='card'><h2>Screensaver</h2>"
-    "<p>Upload raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
-    "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
+    "<div class='actions' style='margin-top:24px;'><button type='submit'>Сохранить настройки</button><span class='muted'>Нет внешних скриптов, файлов и шрифтов.</span></div></form></div>"
+    "<div class='card'><h2>Скринсейвер</h2>"
+    "<p>Формат raw XBM : <b>3904 байт</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
+    "<p class='muted'>Совет: используйте <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> с параметрами <b>Plain bytes</b>. При необходимости инвертируйте цвета.</p>";
 
   if (hasSleepImg) {
-    out += "<div class='status ok'>&#10003; Custom screensaver active. <a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">Delete</a></div>";
+    out += "<div class='status ok'>&#10003; Активна пользовательская заставка. <a class='link' href='/del-sleep' onclick=\"return confirm('Удалить пользовательскую заставку?')\">Удалить</a></div>";
   } else {
-    out += "<div class='status idle'>Using built-in screensaver.</div>";
+    out += "<div class='status idle'>Используется встроенная заставка.</div>";
   }
 
   out +=
     "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px'>"
-    "<div class='grid'><div><label for='file'>Sleep image file</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
-    "<div class='actions'><button type='submit'>Upload image</button></div>"
+    "<div class='grid'><div><label for='file'>Файл заставки</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
+    "<div class='actions'><button type='submit'>Загрузить</button></div>"
     "</form></div></div></body></html>";
 
   server.send(200, "text/html; charset=utf-8", out);
 }
 
 static void handleSettingsPost() {
-  bool layoutChanged = false;
-
   if (server.hasArg("font")) {
     int fs = server.arg("font").toInt();
-    if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
-    if (fs != g_settings.fontSize) {
-      applyFontSize(fs);
-      prefs.putInt("cfg_font", fs);
-      layoutChanged = true;
-    }
+    if (fs != 6 && fs != 10 && fs != 8 && fs != 9) fs = 10;
+    applyFontSize(fs);
+    prefs.putInt("cfg_font", fs);
   }
-
   if (server.hasArg("sleep")) {
     int ss = server.arg("sleep").toInt();
     if (ss < 10) ss = 10;
     if (ss > 3600) ss = 3600;
-    if ((uint32_t)ss != g_settings.sleepSecs) {
-      g_settings.sleepSecs = (uint32_t)ss;
-      prefs.putInt("cfg_sleep", ss);
-    }
+    g_settings.sleepSecs = (uint32_t)ss;
+    prefs.putInt("cfg_sleep", ss);
   }
-
   if (server.hasArg("lgap")) {
     int lg = server.arg("lgap").toInt();
     if (lg < 0) lg = 0;
     if (lg > 4) lg = 4;
-    if (lg != g_settings.lineGap) {
-      g_settings.lineGap = lg;
-      prefs.putInt("cfg_lgap", lg);
-      invalidateMetrics();
-      layoutChanged = true;
-    }
+    g_settings.lineGap = lg;
+    prefs.putInt("cfg_lgap", lg);
+    invalidateMetrics();
   }
-
-  if (layoutChanged) {
-    // invalidateAllPageCaches() already resets pageIndex to 0 for the open book.
-    // Call it BEFORE renderCurrentPage() so the page is redrawn from byte 0
-    // with the new font metrics -- not from the now-invalid old page number.
-    invalidateAllPageCaches();
-    if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
-      g_bookmarkUi.previewActive = false; // exit preview on layout change
-      mode = MODE_READER;
-      renderCurrentPage();
-    }
-  }
-
   server.sendHeader("Location", "/settings");
   server.send(302, "text/plain", "");
 }
-
 
 static void handleDeleteSleepImg() {
   if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
@@ -4028,12 +3407,12 @@ static void handleUploadSleepDone() {
 
   String inner;
   inner.reserve(500);
-  inner += "<div class='card'><h2>Screensaver updated</h2><p class='muted'>Your custom sleep image was saved successfully and will be shown the next time the device goes to sleep.</p><div class='actions'><a class='btn' href='/settings'>Back to settings</a><a class='btn secondary' href='/'>Home</a></div></div>";
+  inner += "<div class='card'><h2>Заставка обновлена</h2><p class='muted'>Ваше пользовательское изображение для спящего режима успешно сохранено и будет отображаться при следующем переходе устройства в спящий режим.</p><div class='actions'><a class='btn' href='/settings'>Вернуться к настройкам</a><a class='btn secondary' href='/'>Домой</a></div></div>";
 
   String page = successPage(
-    "Upload complete",
-    "Screensaver saved successfully.",
-    "&#10003; Custom sleep image uploaded.",
+    "Загрузка завершена",
+    "Заставка сохранена.",
+    "&#10003; Загружено пользовательское изображение спящего режима.",
     inner
   );
   server.send(200, "text/html; charset=utf-8", page);
@@ -4051,18 +3430,16 @@ static void handleUploadBookStream() {
     g_upload.bookFinalName = "";
     g_upload.bookPendingUtf8Tail = "";
     g_upload.bookTmpPath = "";
-    g_upload.bookCompactLastWasSpace = false;
-    g_upload.bookCompactNewlineCount = 0;
 
     loadBooks();
     if (g_library.bookCount >= MAX_BOOKS) {
-      g_upload.bookError = "Library full";
+      g_upload.bookError = "Библиотека заполнена";
       return;
     }
 
     size_t freeBytes = fsFreeBytesSafe();
     if (freeBytes < 8192) {
-      g_upload.bookError = "Not enough free space";
+      g_upload.bookError = "Недостаточно свободного места";
       return;
     }
 
@@ -4073,81 +3450,55 @@ static void handleUploadBookStream() {
     if (FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
     g_upload.bookTmpFile = FS.open(g_upload.bookTmpPath, "w");
     if (!g_upload.bookTmpFile) {
-      g_upload.bookError = "Cannot create temp upload file";
+      g_upload.bookError = "Не могу создать временный файл при загрузке";
       g_upload.bookTmpPath = "";
     }
   }
   else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_upload.bookError.length() > 0) return;
     if (g_upload.bookTmpFile && up.currentSize > 0) {
       String chunk = g_upload.bookPendingUtf8Tail + String((const char*)up.buf, up.currentSize);
       int len = (int)chunk.length();
-      if (len > 4) {
-        g_upload.bookPendingUtf8Tail = chunk.substring(len - 4);
-        chunk = chunk.substring(0, len - 4);
+      if (len > 3) {
+        g_upload.bookPendingUtf8Tail = chunk.substring(len - 3);
+        chunk = chunk.substring(0, len - 3);
       } else {
         g_upload.bookPendingUtf8Tail = chunk;
         chunk = "";
       }
       if (chunk.length() > 0) {
         String cleaned = normalizeTypography(chunk);
-        cleaned = compactText(cleaned,
-                              &g_upload.bookCompactLastWasSpace,
-                              &g_upload.bookCompactNewlineCount,
-                              false);
-        size_t cleanedLen = cleaned.length();
-        size_t wrote = g_upload.bookTmpFile.print(cleaned);
-        if (wrote != cleanedLen) {
-          // Short write — out of space or FS error. Abort the upload so a
-          // truncated file isn't promoted to a finalized book.
-          g_upload.bookError = "Write failed (out of space?)";
-          g_upload.bookTmpFile.close();
-          if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) {
-            FS.remove(g_upload.bookTmpPath);
-          }
-        }
+        cleaned = compactText(cleaned);
+        g_upload.bookTmpFile.print(cleaned);
       }
     }
   }
   else if (up.status == UPLOAD_FILE_END) {
-    if (g_upload.bookError.length() > 0 && !g_upload.bookTmpFile) return;
     if (g_upload.bookTmpFile) {
       if (g_upload.bookPendingUtf8Tail.length() > 0) {
         String cleaned = normalizeTypography(g_upload.bookPendingUtf8Tail);
-        cleaned = compactText(cleaned,
-                              &g_upload.bookCompactLastWasSpace,
-                              &g_upload.bookCompactNewlineCount,
-                              true);
-        size_t cleanedLen = cleaned.length();
-        size_t wrote = g_upload.bookTmpFile.print(cleaned);
-        if (wrote != cleanedLen && g_upload.bookError.length() == 0) {
-          g_upload.bookError = "Write failed (out of space?)";
-        }
+        cleaned = compactText(cleaned);
+        g_upload.bookTmpFile.print(cleaned);
         g_upload.bookPendingUtf8Tail = "";
       }
       g_upload.bookTmpFile.close();
 
-      if (g_upload.bookError.length() > 0) {
-        if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) {
-          FS.remove(g_upload.bookTmpPath);
-        }
-      } else if (g_upload.bookTmpPath.length() > 0 && up.totalSize > 0) {
+      if (g_upload.bookTmpPath.length() > 0 && up.totalSize > 0) {
         String finalPath = g_upload.bookTmpPath.substring(0, g_upload.bookTmpPath.length() - 4);
         if (FS.exists(finalPath)) FS.remove(finalPath);
         if (FS.rename(g_upload.bookTmpPath, finalPath)) {
           g_upload.bookOk = true;
         } else {
           if (FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-          g_upload.bookError = "Failed to finalize upload";
+          g_upload.bookError = "Не удалось завершить загрузку";
         }
       } else {
         if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-        g_upload.bookError = "Empty upload";
+        g_upload.bookError = "Ничего не загружено";
       }
       g_upload.bookTmpPath = "";
     } else {
       if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-      if (g_upload.bookError.length() == 0) g_upload.bookError = "Upload failed";
+      if (g_upload.bookError.length() == 0) g_upload.bookError = "Загрузка не удалась";
       g_upload.bookTmpPath = "";
     }
   }
@@ -4157,7 +3508,7 @@ static void handleUploadBookStream() {
     g_upload.bookPendingUtf8Tail = "";
     g_upload.bookTmpPath = "";
     g_upload.bookOk = false;
-    g_upload.bookError = "Upload aborted";
+    g_upload.bookError = "Загрузка прервана";
   }
 }
 
@@ -4170,7 +3521,7 @@ static void handleUploadSleepStream() {
     g_upload.sleepTmpPath = "/sleep.bin.tmp";
     if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
     g_upload.sleepTmpFile = FS.open(g_upload.sleepTmpPath, "w");
-    if (!g_upload.sleepTmpFile) g_upload.sleepError = "Cannot create temp sleep file";
+    if (!g_upload.sleepTmpFile) g_upload.sleepError = "Не удалось создать временный файл";
   }
   else if (upS.status == UPLOAD_FILE_WRITE) {
     if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.write(upS.buf, upS.currentSize);
@@ -4183,14 +3534,14 @@ static void handleUploadSleepStream() {
 
     if (sz != 3904) {
       if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-      g_upload.sleepError = "Sleep image must be exactly 3904 bytes";
+      g_upload.sleepError = "Заставка должна быть размером точно 3904 байта";
       g_upload.sleepOk = false;
     } else {
       if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
       if (FS.rename(g_upload.sleepTmpPath, "/sleep.bin")) g_upload.sleepOk = true;
       else {
         if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-        g_upload.sleepError = "Failed to save sleep image";
+        g_upload.sleepError = "Не удалось сохранить заставку";
       }
     }
     g_upload.sleepTmpPath = "";
@@ -4198,106 +3549,9 @@ static void handleUploadSleepStream() {
   else if (upS.status == UPLOAD_FILE_ABORTED) {
     if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
     if (g_upload.sleepTmpPath.length() > 0 && FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-    g_upload.sleepError = "Sleep image upload aborted";
+    g_upload.sleepError = "Загрузка заставки прервана";
     g_upload.sleepOk = false;
     g_upload.sleepTmpPath = "";
-  }
-}
-
-static void handleUploadAppDone() {
-  if (!g_upload.appOk) {
-    server.send(400, "text/plain; charset=utf-8",
-                g_upload.appError.length() ? g_upload.appError : "App upload failed");
-    return;
-  }
-  String inner;
-  inner.reserve(400);
-  inner += "<div class='card'><h2>App uploaded</h2>"
-           "<p class='muted'>App is now available in the Apps menu on the device.</p>"
-           "<div class='actions'><a class='btn' href='/'>Upload another</a></div></div>";
-  String page = successPage("App uploaded", "App saved.", "&#10003; App ready.", inner);
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-static void handleUploadAppStream() {
-  HTTPUpload& up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    g_upload.appOk = false;
-    g_upload.appError = "";
-    g_upload.appFinalName = "";
-    g_upload.appTmpPath = "";
-
-    size_t freeBytes = fsFreeBytesSafe();
-    if (freeBytes < 4096) {
-      g_upload.appError = "Not enough free space";
-      return;
-    }
-
-    // sanitizeUploadedFilename appends .txt; strip all extensions then re-add .bin
-    String fname = sanitizeUploadedFilename(up.filename);
-    int dot = fname.lastIndexOf('.');
-    while (dot > 0) { fname = fname.substring(0, dot); dot = fname.lastIndexOf('.'); }
-    if (fname.length() == 0) fname = "app";
-    fname += ".bin";
-
-    g_upload.appFinalName = fname;
-    g_upload.appTmpPath = "/apps/" + fname + ".tmp";
-    if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-    g_upload.appTmpFile = FS.open(g_upload.appTmpPath, "w");
-    if (!g_upload.appTmpFile) {
-      g_upload.appError = "Cannot create temp app file";
-      g_upload.appTmpPath = "";
-    }
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_upload.appError.length() > 0) return;
-    if (g_upload.appTmpFile) g_upload.appTmpFile.write(up.buf, up.currentSize);
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
-    if (g_upload.appError.length() > 0 || g_upload.appTmpPath.length() == 0) return;
-
-    if (up.totalSize < sizeof(PalaAppHeader) + 4) {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "App binary too small";
-      g_upload.appTmpPath = "";
-      return;
-    }
-
-    // Validate magic before committing
-    bool validMagic = false;
-    File vf = FS.open(g_upload.appTmpPath, "r");
-    if (vf) {
-      PalaAppHeader hdr;
-      if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr))
-        validMagic = (hdr.magic == PALA_APP_MAGIC);
-      vf.close();
-    }
-    if (!validMagic) {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "Invalid app binary (bad magic)";
-      g_upload.appTmpPath = "";
-      return;
-    }
-
-    String finalPath = "/apps/" + g_upload.appFinalName;
-    if (FS.exists(finalPath)) FS.remove(finalPath);
-    if (FS.rename(g_upload.appTmpPath, finalPath)) {
-      g_upload.appOk = true;
-    } else {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "Failed to finalize app upload";
-    }
-    g_upload.appTmpPath = "";
-  }
-  else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
-    if (g_upload.appTmpPath.length() > 0 && FS.exists(g_upload.appTmpPath))
-      FS.remove(g_upload.appTmpPath);
-    g_upload.appTmpPath = "";
-    g_upload.appOk = false;
-    g_upload.appError = "Upload aborted";
   }
 }
 
@@ -4307,21 +3561,20 @@ static void handleUploadAppStream() {
 static void registerWebRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/files", HTTP_GET, handleFiles);
-  server.on("/del",     HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
-  server.on("/del-app", HTTP_POST, handleDeleteApp);
+  server.on("/del", HTTP_GET, handleDelete);
   server.on("/mkdir", HTTP_POST, handleCreateFolder);
   server.on("/move", HTTP_POST, handleMoveBook);
   server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
   server.on("/list", HTTP_GET, handleListWeb);
   server.on("/list", HTTP_POST, handleListSaveWeb);
   server.on("/list-clear-done", HTTP_POST, handleListClearDoneWeb);
-  server.on("/rmdir", HTTP_POST, handleDeleteFolder); // POST: destructive
+  server.on("/rmdir", HTTP_GET, handleDeleteFolder);
 
   server.on("/reset", HTTP_GET, handleResetConfirm);
   server.on("/reset", HTTP_POST, handleResetDo);
 
   server.on("/bookmarks", HTTP_GET, handleBookmarksWeb);
-  server.on("/delbm",  HTTP_POST, handleDeleteBookmarkWeb); // POST: destructive
+  server.on("/delbm", HTTP_GET, handleDeleteBookmarkWeb);
   server.on("/viewbm", HTTP_GET, handleViewBookmarkWeb);
   server.on("/exportbm", HTTP_GET, handleExportBookmarksWeb);
 
@@ -4330,15 +3583,12 @@ static void registerWebRoutes() {
   server.on("/del-sleep", HTTP_GET, handleDeleteSleepImg);
 
   server.on("/upload-sleep", HTTP_POST, handleUploadSleepDone, handleUploadSleepStream);
-  server.on("/upload-app",   HTTP_POST, handleUploadAppDone,   handleUploadAppStream);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBookStream);
 }
 
 static void startUploadMode() {
   mode = MODE_UPLOAD;
   g_upload.startedMs = millis();
-
-  setCpuFrequencyMhz(240); // WiFi AP needs full speed
 
   prepareMenuFrame();
 
@@ -4347,11 +3597,11 @@ static void startUploadMode() {
   IPAddress ip = WiFi.softAPIP();
   String url = String("http://") + ip.toString();
 
-  int y = drawSectionHeader("Upload");
+  int y = drawSectionHeader("Загрузка по WIFI", true);
 
   u8g2.setFont(BOLD_FONT);
   u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Wi-Fi");
+  u8g2.print("Сеть");
   y += 14;
 
   u8g2.setFont(MAIN_FONT);
@@ -4361,7 +3611,7 @@ static void startUploadMode() {
 
   u8g2.setFont(BOLD_FONT);
   u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Password");
+  u8g2.print("Ключ");
   y += 14;
 
   u8g2.setFont(MAIN_FONT);
@@ -4371,7 +3621,7 @@ static void startUploadMode() {
 
   u8g2.setFont(BOLD_FONT);
   u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Open");
+  u8g2.print("Адрес");
   y += 14;
 
   u8g2.setFont(MAIN_FONT);
@@ -4386,9 +3636,8 @@ static void startUploadMode() {
 static void stopUploadModeToLibrary() {
   server.stop();
 
-  if (g_upload.bookTmpFile)  g_upload.bookTmpFile.close();
+  if (g_upload.bookTmpFile) g_upload.bookTmpFile.close();
   if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
-  if (g_upload.appTmpFile)   g_upload.appTmpFile.close();
 
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, true);
@@ -4407,15 +3656,9 @@ static void stopUploadModeToLibrary() {
   g_upload.sleepError = "";
   g_upload.sleepTmpPath = "";
 
-  g_upload.appOk = false;
-  g_upload.appError = "";
-  g_upload.appTmpPath = "";
-  g_upload.appFinalName = "";
-
   loadBooks();
   mode = MODE_LIBRARY;
   resetInputFrontend();
-  setCpuFrequencyMhz(80); // back to low-power idle
   drawLibrary();
 }
 
@@ -4449,11 +3692,11 @@ static void goToSleep() {
     int tmpPage = g_reader.pageIndex;
     g_reader.pageIndex = g_bookmarkUi.previewSavedPage;
     saveProgressThrottled(true);
-    if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
     g_reader.pageIndex = tmpPage;
   } else if (mode == MODE_READER) {
     saveProgressThrottled(true);
-    if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
   }
 
   delay(50);
@@ -4485,13 +3728,12 @@ static void goToSleep() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  setCpuFrequencyMhz(240); // full speed for init; lowered to 80 MHz at end of setup
+  setCpuFrequencyMhz(240);
 
   pinMode(BTN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN), btnISR, CHANGE);
 
   u8g2.begin(gfx);
-  initPalaAPI();
   invalidateMetrics();
   (void)getMetrics();
   resetOffsetCache();
@@ -4506,11 +3748,10 @@ void setup() {
   display.clear();
 
   if (!fsBegin()) {
-    drawCenter("Storage error", "Try factory reset");
+    drawCenter("Файловая система повреждена", "Нужна перепрошивка или сброс настроек");
     return;
   }
   ensureBooksDir();
-  if (!FS.exists("/apps")) FS.mkdir("/apps");
 
   {
     uint64_t chipId = ESP.getEfuseMac();
@@ -4532,9 +3773,9 @@ void setup() {
           if (openBookByIndex(i)) {
             resetPreviewState();
             mode = MODE_READER;
+            resetInputFrontend();
             g_reader.pageTurnsSinceFull = FULL_REFRESH_EVERY_N_PAGES;
-            renderCurrentPage();   // draw first — takes ~300ms, user releases button during this
-            resetInputFrontend();  // then discard the wake-press only
+            renderCurrentPage();
             restored = true;
           }
           break;
@@ -4547,10 +3788,6 @@ void setup() {
     drawLibrary();
     resetInputFrontend();
   }
-
-  // Drop to 80 MHz for normal operation — saves significant power.
-  // Upload mode will raise it back to 240 MHz temporarily.
-  setCpuFrequencyMhz(80);
 }
 
 // ============================================================================
@@ -4569,30 +3806,7 @@ static void handleModeAbout() {
   }
 }
 
-static void handleModeApps() {
-  if (btns.shortClick) {
-    if (g_apps.count > 0)
-      g_apps.selectedIndex = (g_apps.selectedIndex + 1) % g_apps.count;
-    drawAppsMenu();
-    return;
-  }
-  if (btns.doubleClick) {
-    if (g_apps.count > 0 && g_apps.selectedIndex < g_apps.count) {
-      loadAndRunApp(g_apps.apps[g_apps.selectedIndex].path);
-      drawAppsMenu();
-    }
-    return;
-  }
-  // Triple-click handled globally → library root
-}
-
 static void handleModeBookmarkBookSelect() {
-  if (btns.tripleClick) {
-    enterLibraryRoot(true);
-    markUserActivity();
-    return;
-  }
-
   if (g_library.bookCount == 0) {
     if (btns.anyClick()) {
       mode = MODE_LIBRARY;
@@ -4623,10 +3837,8 @@ static void handleModeBookmarkBookSelect() {
 }
 
 static void handleModeBookmarkList() {
-  // NOTE: g_bookmarkUi.count/.pages/.offsets are loaded once by drawBookmarksList()
-  // when entering this mode. No need to reload from Preferences every loop.
-  if (!btns.anyClick()) return;
-
+  String key = prefKeyForBook(String(g_library.books[g_bookmarkUi.bookIndex].path));
+  g_bookmarkUi.count = loadBookmarksForKey(key, g_bookmarkUi.pages, g_bookmarkUi.offsets);
   if (g_bookmarkUi.selectedIndex >= (int)g_bookmarkUi.count) g_bookmarkUi.selectedIndex = max(0, (int)g_bookmarkUi.count - 1);
 
   if (btns.shortClick) {
@@ -4662,15 +3874,7 @@ static void handleModeBookmarkList() {
     return;
   }
 
-  if (btns.tripleClick) {
-    // Triple-click = all the way home to library root
-    enterLibraryRoot(true);
-    markUserActivity();
-    return;
-  }
-
   if (btns.longClick) {
-    // Long-click = back to book select
     mode = MODE_BM_BOOK_SELECT;
     drawBookmarksBookSelect();
     return;
@@ -4679,19 +3883,17 @@ static void handleModeBookmarkList() {
 
 static void handleModeBookmarkPreview() {
   if (btns.tripleClick) {
-    // Triple-click = back to bookmark list (where the user came from)
     g_bookmarkUi.previewActive = false;
-    safeCloseCurrentBook();
-    mode = MODE_BM_LIST;
-    drawBookmarksList();
+    g_reader.pageIndex = g_bookmarkUi.previewSavedPage;
+    mode = MODE_READER;
+    renderCurrentPage();
     return;
   }
 
   if (btns.longClick) {
-    // Long-press = accept this bookmark position, continue reading from here
     g_bookmarkUi.previewActive = false;
     saveProgressThrottled(true);
-    if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
+    savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
     mode = MODE_READER;
     renderCurrentPage();
     return;
@@ -4720,8 +3922,7 @@ static void handleModeBookmarkPreview() {
 }
 
 static void handleModeLibrary() {
-  if (!btns.anyClick()) return; // nothing to do — don't rebuild entries every loop
-
+  buildLibraryEntries();
   int totalItems = g_library.entryCount;
 
   if (btns.shortClick) {
@@ -4756,6 +3957,7 @@ static void handleModeLibrary() {
       renderCurrentPage();
     } else {
       drawCenter("Open failed", "Try upload again");
+      delay(600);
       drawLibrary();
     }
     return;
@@ -4778,14 +3980,6 @@ static void handleModeLibrary() {
   if (entryType == LIB_ENTRY_ABOUT) {
     mode = MODE_ABOUT;
     drawAbout();
-    return;
-  }
-
-  if (entryType == LIB_ENTRY_APPS) {
-    g_apps.selectedIndex = 0;
-    scanApps();
-    mode = MODE_APPS;
-    drawAppsMenu();
     return;
   }
 
@@ -4898,15 +4092,9 @@ void loop() {
     return;
   }
 
-  // Global triple-click = go home to library root.
-  // Bookmark screens handle triple-click themselves for correct back-navigation,
-  // so exclude them here.
-  if (btns.tripleClick && mode != MODE_UPLOAD
-      && mode != MODE_BM_PREVIEW
-      && mode != MODE_BM_LIST
-      && mode != MODE_BM_BOOK_SELECT) {
+  if (btns.tripleClick && mode != MODE_UPLOAD && mode != MODE_BM_PREVIEW) {
     enterLibraryRoot(true);
-    markUserActivity();
+    resetInputFrontend();
     return;
   }
 
@@ -4914,7 +4102,6 @@ void loop() {
     case MODE_UPLOAD:         handleModeUpload(); break;
     case MODE_ABOUT:          handleModeAbout(); break;
     case MODE_LIST:           handleModeList(); break;
-    case MODE_APPS:           handleModeApps(); break;
     case MODE_BM_BOOK_SELECT: handleModeBookmarkBookSelect(); break;
     case MODE_BM_LIST:        handleModeBookmarkList(); break;
     case MODE_BM_PREVIEW:     handleModeBookmarkPreview(); break;
