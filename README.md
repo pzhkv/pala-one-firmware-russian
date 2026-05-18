@@ -23,37 +23,6 @@ The board version is usually printed on the back of the PCB.
 
 Both versions are built from the same source file (`Pala_One_2_1/Pala_One_2_1.ino`). Open it in Arduino IDE and uncomment the `#define` at the top that matches your hardware before compiling.
 
-## Apps
-
-Apps are compiled separately and uploaded to the device via the WiFi web interface — no firmware rebuild needed. The Apps menu discovers all `.bin` files in `/apps/` on the device and lists them by name.
-
-### Building an app
-
-You need:
-- The `xtensa-esp32s3-elf-gcc` cross-compiler, which ships with the Arduino ESP32 board package. On Linux it is found under `~/.arduino15/packages/esp32/tools/esp-x32/<version>/bin/`; the `Makefile` locates it automatically.
-- `python3` (for the post-build step that patches the entry point offset into the binary).
-
-An app is a single C file that includes `pala_app.h` and `pala_api.h` from the firmware source and exports a `void app_main(const PalaAPI* api)` entry point. The header struct at the start of the binary carries the display name and API version check.
-
-See `examples/click_counter/` for a complete working example with a `Makefile`.
-
-```bash
-cd examples/click_counter
-make
-# produces click_counter.bin
-```
-
-### Uploading an app
-
-1. Select **Upload** from the library menu on the device.
-2. Connect to the `PALA-XXXXXX` WiFi network (password: `palaread`).
-3. Open `http://192.168.4.1` in a browser.
-4. Use the **Upload app (.bin)** card to upload your `.bin` file.
-5. Triple-click to exit upload mode — the app will appear in the Apps menu immediately.
-
-### App API
-
-Apps communicate with the firmware through the `PalaAPI` function pointer table passed to `app_main`. The current API version is **v3** (`PALA_API_VERSION 3` in `pala_app.h`).
 
 #### Display
 
@@ -74,13 +43,6 @@ Apps communicate with the firmware through the `PalaAPI` function pointer table 
 | `buttonPressed()` | Returns 1 if the button is currently held, 0 otherwise |
 | `pendingPresses()` | Count of individual short press-release events since last call; bypasses multi-click grouping |
 
-#### Timing
-
-| Function | Description |
-|---|---|
-| `millisNow()` | Current uptime in milliseconds |
-| `delayMs(ms)` | Yield for `ms` milliseconds |
-| `rtcSeconds()` | Monotonic seconds counter that survives deep sleep; use for cross-session timing |
 
 #### Storage
 
@@ -89,19 +51,6 @@ Apps communicate with the firmware through the `PalaAPI` function pointer table 
 | `storageRead(key, buf, maxlen)` | Read from `/apps/{key}.dat`; returns bytes read, -1 on error |
 | `storageWrite(key, buf, len)` | Write to `/apps/{key}.dat`; returns bytes written, -1 on error |
 
-#### Utilities
-
-| Function | Description |
-|---|---|
-| `snprintf_wrap(buf, len, fmt, ...)` | Standard `snprintf` |
-
-Return from `app_main` to exit back to the Apps menu. Apps decide their own exit gesture — the firmware does not impose one.
-
-**Constraints:**
-- Apps must be compiled `-fPIC -mlongcalls` (position-independent).
-- Apps must not use static mutable variables — the loader does not patch `.data` relocations.
-- Maximum binary size: 48 KB.
-- The `api_version` field in `PalaAppHeader` must match `PALA_API_VERSION` exactly — the firmware rejects mismatched binaries.
 
 ## Features
 
